@@ -662,11 +662,25 @@ uint8_t* lcdTargetRecvBegin(size_t* maxBytes)
     return psramPool + poolUsed;     // 接收基址（commit 时再 poolAlloc 正式占用）
 }
 
+// ★ 忙等 lcdTask 处理有 5s 超时兜底：本函数运行在 mqttCallback→webTask 上下文，
+//   期间 webTask 不喂 TWDT（8s）。若 lcdTask 因任何原因未及时响应（渲染卡顿/解码
+//   损坏帧/被挂起），死等会撑爆看门狗 panic 重启。超时改为返回失败，上层走 rollback +
+//   回 VIDEO_FAIL，最坏退化成"本次传输失败可重试"，绝不再拖到重启。
+#define LCD_RECV_WAIT_TIMEOUT_MS  5000
+
 bool lcdTargetRecvCommit(size_t size)
 {
     g_tgtDone = false; g_tgtOk = false;
     g_tgtReq  = (int)size;
-    while (!g_tgtDone) vTaskDelay(pdMS_TO_TICKS(5));
+    uint32_t t0 = millis();
+    while (!g_tgtDone) {
+        if (millis() - t0 > LCD_RECV_WAIT_TIMEOUT_MS) {
+            LOG("[LCD] ✗ commit 等 lcdTask 超时(%dms)，判失败\n", LCD_RECV_WAIT_TIMEOUT_MS);
+            g_tgtReq = 0;                 // 撤请求（lcdTask 下轮读到 0 直接跳过）
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
     return g_tgtOk;
 }
 
@@ -674,7 +688,15 @@ void lcdTargetRecvAbort()
 {
     g_tgtDone = false;
     g_tgtReq  = -1;
-    while (!g_tgtDone) vTaskDelay(pdMS_TO_TICKS(5));
+    uint32_t t0 = millis();
+    while (!g_tgtDone) {
+        if (millis() - t0 > LCD_RECV_WAIT_TIMEOUT_MS) {
+            LOG("[LCD] ✗ abort 等 lcdTask 超时(%dms)，放弃等待\n", LCD_RECV_WAIT_TIMEOUT_MS);
+            g_tgtReq = 0;
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
 }
 
 // 在 lcdTask 循环里调用：真正执行 commit/abort（池操作的属主在此）

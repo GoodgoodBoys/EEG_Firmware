@@ -20,6 +20,7 @@
 #include "driver/rtc_io.h"
 #include "driver/gpio.h"
 #include "esp_task_wdt.h"
+#include "esp_random.h"
 
 #define VERSION "0.1"
 #define RESOURCE_MONITOR_INTERVAL_MS 5000
@@ -44,6 +45,10 @@ volatile uint32_t g_batMv      = 0;
 
 volatile bool g_batCharging = false;
 volatile int g_pwrTier = 0;
+
+// 本次开机随机数：随 devInfo 上报，App 据此秒级识别"设备重启过"→ 中止在途传输，不等超时。
+// 每次上电/重启都不同；同一次开机内恒定（bind/配置更新重发 devInfo 时不变，故不误判）。
+volatile uint32_t g_bootId = 0;
 
 // NVS SN
 NvsSn g_sn;
@@ -362,6 +367,10 @@ void setup() {
     LOG("║   EGG ESP32-S3   固件版本 v%-10s║\n", VERSION);
     LOG("╚══════════════════════════════════════╝\n");
     LOG("[BOOT] 系统启动...\n");
+
+    // 本次开机随机数（供 App 识别设备重启）。esp_random 在 RF 未启用时熵偏弱但足够区分开机。
+    g_bootId = esp_random();
+    LOG("[BOOT] bootId=%u\n", (unsigned)g_bootId);
 
     // 唤醒原因：区分正常上电 / 从关机(深睡)被拍醒
     esp_sleep_wakeup_cause_t wc = esp_sleep_get_wakeup_cause();

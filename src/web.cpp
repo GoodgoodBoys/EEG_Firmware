@@ -7,6 +7,7 @@
 #include <time.h>
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
+#include "esp_random.h"
 #include "mbedtls/md.h"
 
 #include "inc/debug.hpp"
@@ -41,8 +42,10 @@
 #define WEB_L2_POLL_MS  500   // L2 下 MQTT 轮询周期 ≈ 推送唤醒延迟上限。
                               // ↑省电 ↓延迟；保持 ≤700 以确保推送在 1s 内被处理。
 
-#define XFER_RX_TIMEOUT_MS  30000  // 传输中超过这么久没再收到分片 → 判 App 掉线，
+#define XFER_RX_TIMEOUT_MS  10000  // 传输中超过这么久没再收到分片 → 判 App 掉线/崩溃，
                                    // 自动回滚解锁，避免设备永久卡在锁定态耗电。
+                                   // 分片走 QoS1（broker 会重传），10s 足够覆盖正常网络抖动；
+                                   // 从 30s 收紧，让 App 崩溃后设备更快解锁自愈、少耗电。
 
 char clientId[48];
 char pubAddr[64];
@@ -67,6 +70,8 @@ extern void mainWake();         // 唤醒主循环（V1_1.cpp）
 
 extern volatile int g_pwrTier;   // 0/1/2 功耗档位（V1_1.ino 定义）
 extern volatile int g_xferAnim;  // LCD 传输动画（lcd.cpp）：0=无 / 1=转圈 / 2=打勾
+extern volatile uint32_t g_bootId;   // 本次开机随机数（V1_1.cpp 定义）：随 devInfo 上报，
+                                     // App 据此秒级识别"设备重启过"→ 中止在途传输，不等超时
 
 WiFiClientSecure espClient;
 PubSubClient     client(espClient);
@@ -92,6 +97,22 @@ typedef enum {
 
 static xferState_t xferState = XFER_IDLE;
 
+// ★ 传输会话 ID（App 每次发送生成，随 NEW_* 带来）：设备只认与本次 NEW 一致的 END，
+//   拒收过期/错乱会话（如一端重启后旧会话的残留 END）。0 = App 未带（旧版本，跳过校验）。
+static uint32_t g_curXferId = 0;
+
+// 从数据主题控制帧 payload 里取 xferId，与本次会话比对。
+//   App 未带（=0）或本机会话未记录（=0）时返回 true（向后兼容，不误杀）。
+static bool xferIdMatches(const byte* payload, unsigned int length)
+{
+    if (g_curXferId == 0) return true;                 // 本会话未带 id → 不校验
+    StaticJsonDocument<256> d;
+    if (deserializeJson(d, payload, length)) return true;  // 解析失败不误杀，交由头尾校验兜底
+    uint32_t id = d["xferId"] | 0;
+    if (id == 0) return true;                          // App 未带 id → 兼容旧版
+    return id == g_curXferId;
+}
+
 // ══════════════════════════════════════════════════════════════
 //  直收进 PSRAM（接收期不碰 flash）
 //    NEW_* 时向 LCD/audio 要一块 PSRAM 基址；分片直接 memcpy 进去；
@@ -113,6 +134,13 @@ typedef struct { const uint8_t* src; size_t len; char path[64]; } PersistJob_t;
 static QueueHandle_t     qPersist        = nullptr;
 static TaskHandle_t      xPersistTask     = nullptr;
 volatile int             g_persistPending = 0;   // 在途持久化作业数（排空屏障；lcd.cpp 读取判"存盘中"→降载）
+// ★ 计数跨任务读改写：webTask 加、persistTask 减。volatile int 的 ++/-- 非原子，
+//   两核并发可能算错 → waitPersistIdle 永久等待。统一走临界区封装保证原子。
+static portMUX_TYPE      s_pendMux = portMUX_INITIALIZER_UNLOCKED;
+// 读到普通 int 再写回，避免对 volatile 直接 ++/--（-Wvolatile 弃用告警）；原子性由临界区保证。
+static inline void pendInc()   { portENTER_CRITICAL(&s_pendMux); int v = g_persistPending; g_persistPending = v + 1;              portEXIT_CRITICAL(&s_pendMux); }
+static inline void pendDec()   { portENTER_CRITICAL(&s_pendMux); int v = g_persistPending; if (v > 0) g_persistPending = v - 1;    portEXIT_CRITICAL(&s_pendMux); }
+static inline void pendReset() { portENTER_CRITICAL(&s_pendMux); g_persistPending = 0;                                             portEXIT_CRITICAL(&s_pendMux); }
 static volatile bool     g_persistAllOk   = true; // 本轮所有落盘是否都成功
 static volatile bool     g_videoResultPend = false; // VIDEO 结果待落盘完成后补发
 static size_t            g_videoResultBytes = 0;  // 补发 VIDEO 结果时用的字节数
@@ -313,6 +341,7 @@ static void buildDevInfoJson(const char* status, char* out, size_t outSize)
     doc["SN"]        = g_sn_str;
     doc["matchCode"] = Config.getString("matchCode", "");
     doc["peerSn"]    = Config.getString("peerSn", "");   // 互绑伙伴 SN（空=未绑），供 App 读绑定态
+    doc["bootId"]    = (uint32_t)g_bootId;                // 本次开机随机数：App 据此识别设备重启（volatile 显式转型避免 ArduinoJson 模板推导问题）
     doc["timestamp"] = getTimestamp();
     uint32_t ut = getUnixTime();
     if (ut > 0) doc["unixTime"] = ut;
@@ -377,7 +406,7 @@ static void persistTask(void* p)
             }
         }
 
-        if (g_persistPending > 0) g_persistPending--;
+        pendDec();
     }
 }
 
@@ -385,9 +414,9 @@ static void enqueuePersist(const uint8_t* src, size_t len, const char* path)
 {
     PersistJob_t job; job.src = src; job.len = len;
     strncpy(job.path, path, sizeof(job.path) - 1); job.path[sizeof(job.path) - 1] = 0;
-    g_persistPending++;
+    pendInc();
     if (xQueueSend(qPersist, &job, 0) != pdTRUE) {
-        g_persistPending--;
+        pendDec();
         g_persistAllOk = false;
         LOG("[PST] ⚠ 持久化队列满，跳过 %s\n", path);
     }
@@ -399,7 +428,18 @@ static void waitPersistIdle()
 {
     if (g_persistPending <= 0) return;
     LOG("[PST] 等待上轮持久化排空（%d 个在途）...\n", g_persistPending);
-    while (g_persistPending > 0) { vTaskDelay(pdMS_TO_TICKS(20)); esp_task_wdt_reset(); }  // 喂狗（未订阅则空操作）
+    // ★ 5s 超时兜底：落盘任务异常/计数错乱时，绝不让新传输永久卡在排空这一步。
+    //   超时强制复位在途计数（旧作业若真在写，最坏是这次落盘失败，PSRAM 内容仍可播）。
+    uint32_t t0 = millis();
+    while (g_persistPending > 0) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        esp_task_wdt_reset();   // 喂狗（未订阅则空操作）
+        if (millis() - t0 > 5000) {
+            LOG("[PST] ⚠ 排空超时(5s)，强制复位在途计数，放行新传输\n");
+            pendReset();
+            break;
+        }
+    }
     LOG("[PST] 持久化已排空\n");
 }
 
@@ -478,6 +518,10 @@ static void publishResultBytes(const char* tag, bool success, size_t bytes)
 
     LOG("[%s] %s | %d 字节 | → %s : %s\n",
         tag, success ? "成功" : "失败", (int)bytes, responseTopic.c_str(), payload);
+    // ★ PubSubClient 只能发 QoS0（发布端不支持 QoS1），回执丢包 App 就白等超时。
+    //   这里连发 2 次做廉价补偿，提高一次送达率；App 端对同一结果天然去重
+    //   （Completer 完成后重复回执被忽略）。真正的可靠兜底是 App 的超时整体重传。
+    client.publish(responseTopic.c_str(), payload);
     client.publish(responseTopic.c_str(), payload);
 }
 
@@ -533,6 +577,15 @@ static volatile int  g_voiceAckId    = -1;
 static int      g_voiceSendingId     = -1;      // 正在发/等 ack 的槽，-1=空闲
 static uint32_t g_voiceAckDeadline   = 0;
 
+// 每个语音槽的唯一 id（0=未分配）。槽号(voice_0..)会被复用，无法区分"新语音"和"同一条重发"；
+// 这个 uid 随 VOICE_BEGIN 发给 App 做去重键，槽被 ack 删除时清零 → 下条新语音拿到全新 uid。
+static uint32_t s_slotUid[VOICE_MAX] = {0};
+static uint32_t slotUid(int slot) {
+    if (slot < 0 || slot >= VOICE_MAX) return 0;
+    if (s_slotUid[slot] == 0) s_slotUid[slot] = esp_random() | 1u;   // |1 确保非 0
+    return s_slotUid[slot];
+}
+
 // 找第一个已存在的语音文件槽；没有返回 -1
 static int findStoredVoiceSlot() {
     char p[24];
@@ -557,6 +610,7 @@ static bool sendVoiceFileTo(int slot, const char* topic) {
     b["msg"]  = "VOICE_BEGIN";
     b["sn"]   = g_sn_str;
     b["id"]   = slot;
+    b["uid"]  = slotUid(slot);          // 不复用的唯一 id：App 用它去重（取代复用的槽号）
     b["size"] = (uint32_t)sz;
     char jb[160]; serializeJson(b, jb, sizeof(jb));
     if (!client.publish(topic, jb)) {
@@ -627,6 +681,8 @@ static void handleVoiceSend() {
         if (g_voiceAcked && g_voiceAckId == g_voiceSendingId) {
             char p[24]; snprintf(p, sizeof(p), VOICE_PATH_FMT, g_voiceSendingId);
             LittleFS.remove(p);
+            if (g_voiceSendingId >= 0 && g_voiceSendingId < VOICE_MAX)
+                s_slotUid[g_voiceSendingId] = 0;   // 释放 uid → 该槽下条新语音拿全新 uid
             LOG("[VOICE] 槽 %d 已送达，删除\n", g_voiceSendingId);
             g_voiceSendingId = -1;
             g_voiceAcked = false;
@@ -807,7 +863,8 @@ static void dispatchCommand(const char* msg, JsonDocument& doc)
 
     // ── NEW_AUDIO：音频直收进 600KB 音频池 ──
     if (strcmp(msg, "NEW_AUDIO") == 0) {
-        LOG("\n[AUDIO] 开始接收音频（直收 PSRAM）\n");
+        g_curXferId = doc["xferId"] | 0;             // 记录本次会话 ID（END 时校验）
+        LOG("\n[AUDIO] 开始接收音频（直收 PSRAM）xferId=%u\n", (unsigned)g_curXferId);
         if (xferState == XFER_IDLE) enterTransferMode();
         size_t maxB = 0;
         g_recvBase = audRecvBegin(&maxB);
@@ -820,7 +877,8 @@ static void dispatchCommand(const char* msg, JsonDocument& doc)
 
     // ── NEW_VIDEO：视频直收进 LCD 池 target 槽 ──
     if (strcmp(msg, "NEW_VIDEO") == 0) {
-        LOG("\n[VIDEO] 开始接收视频（直收 PSRAM）\n");
+        g_curXferId = doc["xferId"] | 0;             // 记录本次会话 ID（END 时校验）
+        LOG("\n[VIDEO] 开始接收视频（直收 PSRAM）xferId=%u\n", (unsigned)g_curXferId);
         if (xferState == XFER_IDLE) enterTransferMode();
         size_t maxB = 0;
         g_recvBase = lcdTargetRecvBegin(&maxB);
@@ -1041,6 +1099,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 
         if (isCtrl && strcmp(ctrl, "END_AUDIO") == 0) {
             if (xferState != XFER_RECEIVING_AUDIO) return;
+            if (!xferIdMatches(payload, length)) {       // ★ 过期/错乱会话（如一端重启后残留 END）
+                LOG("[AUDIO] ✗ xferId 不匹配，丢弃并回滚 + 回 FAIL\n");
+                rollbackAll(); xferState = XFER_IDLE; exitTransferMode();
+                publishResult("AUDIO", false);
+                return;
+            }
             LOG("\n[AUDIO] END_AUDIO\n");
             logXferPerf("AUDIO");
             bool ok = (!receiveError && g_recvLen > 4 && audRecvCommit(g_recvLen));
@@ -1068,6 +1132,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int length)
 
         if (isCtrl && strcmp(ctrl, "END_VIDEO") == 0) {
             if (xferState != XFER_RECEIVING_VIDEO) return;
+            if (!xferIdMatches(payload, length)) {       // ★ 过期/错乱会话（如一端重启后残留 END）
+                LOG("[VIDEO] ✗ xferId 不匹配，丢弃并回滚 + 回 FAIL\n");
+                rollbackAll(); xferState = XFER_IDLE; exitTransferMode();
+                publishResult("VIDEO", false);
+                return;
+            }
             LOG("\n[VIDEO] END_VIDEO\n");
             logXferPerf("VIDEO");
 
