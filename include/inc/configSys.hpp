@@ -27,7 +27,9 @@
 #define CFG_DEF_PASSWORD      ""
 #define CFG_DEF_MATCHCODE     "000000"
 #define CFG_DEF_BRIGHTNESS    128
-#define CFG_DEF_VOLUME        64
+// 音量默认 50%（0~255 量程 ⇒ 128）。与 App 配网页音量条的默认值 50 一致。
+// ★ 这是全工程唯一的音量默认值来源，aud.cpp 的 Config.getInt 兜底也引用它，别再各写一份。
+#define CFG_DEF_VOLUME        128
 
 // ============================================================
 // JSON 文档大小

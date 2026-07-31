@@ -823,17 +823,39 @@ static void handleMatchCommand(const char* msgBuffer)
 // ══════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════
-//  语音消息发送（设备→App，阶段D）
-//    App 发 PULL_VOICE → 设备把 voice_N.mp3 逐条发到 term/<sn>/voice
-//    （VOICE_BEGIN json → 二进制分片 → VOICE_END json）；
-//    收到 App 的 VOICE_OK(带 id) 后删除该文件，再发下一条。
+//  统一语音 ARQ 发送引擎（UVA）——设备→App 与 设备→伙伴 共用一套发送器
+//  （合并原「阶段D App 语音」与「P4 伙伴语音发送」两条路径）
+//
+//  · Go-Back-N 滑动窗口：多片在途填满 RTT（提速关键，停等式每片一个往返在云 broker 上极慢）；
+//    接收端按 offset 顺序落位、回【累积 next】，发送端据此滑窗；停滞(无 ACK 进展)则回退重发整窗。
+//  · 两端 QoS0 安全：不假设回程可靠（伙伴回程也 QoS0），全靠超时重传兜底。
+//    App 回程用 mqtt_client 可发 QoS1、更稳，但引擎完全不依赖它。
+//  · 传输期「对端存活」判据 = 回程 ACK 本身（不再单开心跳）；开传前用重发 BEGIN 握手探测在场。
+//  · 目标两类（UvKind）：
+//      UV_APP  → term/<sn>/voice              ；成功=删语音槽（留言已送达）；失败=不删，留槽等下次 PULL。
+//      UV_PEER → dev/<topicId(peer)>/voicePlay ；伙伴即播即删；本端成功/失败都不动槽（该槽仍归 App 路径）。
+//  · 回程统一走本机 cmd（PV_ACK/PV_DONE/PV_FAIL/PV_BUSY），dispatchCommand 按 xferId 路由到对应会话。
+//  · 协议消息名沿用 PV_*：与设备【接收端】handlePeerVoice 共用同一套，App 端也说这套。
+//    帧常量另起 UV_ 名（值与接收端 PV_ 相同），因接收端的 PV_ 宏定义在本段之后。
 // ══════════════════════════════════════════════════════════════
+#define UV_CHUNK            4000       // 每片数据字节（+9 头 < 4096）
+#define UV_WINDOW_BYTES     (8 * UV_CHUNK)  // 滑动窗口：最多这么多字节可同时在途未确认（=8 片，填满 RTT）。
+                                            //   窗口天然被接收端 ACK 节奏"时钟化"限速，不会淹没慢订阅（不同于旧的整条盲发）。
+#define UV_MAX_SEND_PER_PUMP 2              // ★每轮 pump 最多发几片：靠 5ms pump 节奏把发送限速到 ~2片/5ms，
+                                            //   避免一次猛发整窗(8片/32KB)被 Serverless broker 限速丢 QoS0 片。
+                                            //   仍有窗口(8片在途)填 RTT；发送速率 = min(此节流, 接收端 ACK 速率)。
+#define UV_HDR              9          // 数据帧头：1(magic)+4(xferId,BE)+4(offset,BE)
+#define UV_MAGIC            0xD1       // 数据帧魔数（≠ '{'，与接收端 PV_MAGIC 同值）
+#define UV_STEP_TIMEOUT_MS  1200       // 单步(BEGIN/片/END)等回程 ACK 超时 → 重发当前步
+#define UV_STEP_MAX_RETRY   8          // 单步最大重发次数（超过=链路太差 → 收手）
+#define UV_LIVENESS_MS      6000       // 传输期内连续这么久没有任何回程 → 判对端不在 → 收手
+#define UV_HANDSHAKE_MS     6000       // 开传前(等 BEGIN 应答)前台窗口；超时收手（App 留槽下次再来）
+#define UV_TOTAL_TIMEOUT_MS 180000     // 整条总超时兜底
+
+// App 拉取请求：App 上线/回前台发 PULL_VOICE 置位。App 会话按此把已存语音逐条送出。
 static volatile bool g_pullVoiceReq  = false;
-static volatile bool g_voiceAcked    = false;
-static volatile int  g_voiceAckId    = -1;
-// 非 static：mic.cpp 环形淘汰最旧槽时要读它，跳过"当前正被 App 发送"的槽（volatile：跨任务读）
-volatile int    g_voiceSendingId     = -1;      // 正在发/等 ack 的槽，-1=空闲
-static uint32_t g_voiceAckDeadline   = 0;
+// 非 static：mic.cpp 环形淘汰最旧槽时要读它，跳过"当前正被发往 App 的槽"（volatile：跨任务读）
+volatile int    g_voiceSendingId     = -1;      // App 会话当前所发的槽，-1=空闲
 
 // 每个语音槽的唯一 id（0=未分配）。槽号(voice_0..)会被复用，无法区分"新语音"和"同一条重发"；
 // 这个 uid 随 VOICE_BEGIN 发给 App 做去重键，槽被 ack 删除时清零 → 下条新语音拿到全新 uid。
@@ -860,63 +882,264 @@ static int findStoredVoiceSlot() {
     return -1;
 }
 
-// 发送一条语音：VOICE_BEGIN(json) → 二进制分片 → VOICE_END(json)。
-// 返回 true=整条发完；false=中途断链/publish 失败（未发 VOICE_END，调用方据此
-// 不进等待态、保留请求下轮重试，免得白等 15s ack 超时。
-static bool sendVoiceFileTo(int slot, const char* topic) {
-    char path[24];
-    snprintf(path, sizeof(path), VOICE_PATH_FMT, slot);
-    File f = LittleFS.open(path, FILE_READ);
-    if (!f) { LOG("[VOICE] ✗ 打不开 %s\n", path); return false; }
-    size_t sz = f.size();
+// ── 统一发送会话：一个 App 会话 + 一个 Peer 会话，可并发（一次录音同时发 App 与伙伴）──
+typedef enum { UV_APP, UV_PEER } UvKind;
+typedef enum { UVS_IDLE, UVS_WAIT_READY, UVS_SENDING, UVS_WAIT_DONE } UvState;
 
-    StaticJsonDocument<160> b;
-    b["msg"]  = "VOICE_BEGIN";
-    b["sn"]   = g_sn_str;
-    b["id"]   = slot;
-    b["uid"]  = slotUid(slot);          // 不复用的唯一 id：App 用它去重（取代复用的槽号）
-    b["size"] = (uint32_t)sz;
-    char jb[160]; serializeJson(b, jb, sizeof(jb));
-    if (!client.publish(topic, jb)) {
-        LOG("[VOICE] ✗ VOICE_BEGIN 发送失败（缓冲满/断链），中止槽 %d\n", slot);
-        f.close();
-        return false;
+typedef struct {
+    UvKind   kind;
+    UvState  state;
+    char     dstTopic[64];   // 帧目的主题（App:term/<sn>/voice ; Peer:dev/<topicId(peer)>/voicePlay）
+    uint32_t xferId;
+    int      slot;           // 源语音槽
+    uint32_t uid;            // App 内容去重键（随 BEGIN 发；伙伴忽略）
+    uint8_t* snap;           // UV_PEER：整条 PSRAM 快照；UV_APP=nullptr（直接读槽文件 s_uvAppFile）
+    uint32_t size;
+    uint32_t next;           // 已确认的累积 offset（= 对端期望的下一个 = 窗口左沿）
+    uint32_t sent;           // 已发出的最高 offset（窗口右沿；next..sent 为在途未确认）
+    uint32_t deadline;       // 停滞超时时刻（acked 无进展达此 → 回退重发窗口）
+    int      retry;          // 已重发次数
+    uint32_t startMs;        // 会话起始（总超时/握手窗口基准）
+    uint32_t lastRxMs;       // 上次收到本会话任意回程的时刻（传输期存活时钟）
+} UvSession;
+
+static UvSession s_uvApp  = { UV_APP,  UVS_IDLE, {0}, 0, -1, 0, nullptr, 0, 0, 0, 0, 0, 0, 0 };
+static UvSession s_uvPeer = { UV_PEER, UVS_IDLE, {0}, 0, -1, 0, nullptr, 0, 0, 0, 0, 0, 0, 0 };
+static uint8_t   s_uvFrame[UV_HDR + UV_CHUNK];   // 组帧临时缓冲（各 pump 内同步用完即弃，两会话不并发用同一份）
+static File      s_uvAppFile;                    // UV_APP 直接读的槽文件句柄（本端删槽前不会被别处删）
+
+// 有任一发送会话在跑：webTask 据此提速轮询到 5ms + WiFi 满功率，powerManagerLoop 据此保 CPU 满频。
+static inline bool uvActive() { return s_uvApp.state != UVS_IDLE || s_uvPeer.state != UVS_IDLE; }
+
+// 读源：Peer 从 PSRAM 快照；App 从槽文件按 offset seek 读（只读，无 flash 写冻结问题）。
+static bool uvReadAt(UvSession* s, uint32_t off, uint8_t* dst, uint32_t len) {
+    if (s->kind == UV_PEER) {
+        if (!s->snap) return false;
+        memcpy(dst, s->snap + off, len);
+        return true;
     }
-    client.loop();
+    if (!s_uvAppFile) return false;
+    if (!s_uvAppFile.seek(off)) return false;
+    return (uint32_t)s_uvAppFile.read(dst, len) == len;
+}
 
-    static uint8_t buf[4096];
-    size_t total = 0, n;
-    while ((n = f.read(buf, sizeof(buf))) > 0) {
-        // 分片发失败（缓冲满或断链）：不再发后续分片和 VOICE_END，让 App 收不齐、
-        // 设备走重传逻辑。硬发完只会让 App 算出 size 不符再丢，白费一轮 15s。
-        if (!client.connected() ||
-            !client.publish(topic, buf, (unsigned int)n)) {
-            LOG("[VOICE] ✗ 分片发送失败（已发 %u 字节），中止槽 %d 待重传\n",
-                (unsigned)total, slot);
-            f.close();
-            return false;
+// 组一片数据帧 [magic|xferId(BE)|offset(BE)|data] 并发出（QoS0）。返回 false=读源失败。
+static bool uvSendChunk(UvSession* s, uint32_t off) {
+    if (off > s->size) return false;
+    uint32_t remain = s->size - off;
+    uint32_t want = remain < (uint32_t)UV_CHUNK ? remain : (uint32_t)UV_CHUNK;
+    s_uvFrame[0] = UV_MAGIC;
+    s_uvFrame[1] = (uint8_t)(s->xferId >> 24); s_uvFrame[2] = (uint8_t)(s->xferId >> 16);
+    s_uvFrame[3] = (uint8_t)(s->xferId >> 8);  s_uvFrame[4] = (uint8_t)(s->xferId);
+    s_uvFrame[5] = (uint8_t)(off >> 24);       s_uvFrame[6] = (uint8_t)(off >> 16);
+    s_uvFrame[7] = (uint8_t)(off >> 8);        s_uvFrame[8] = (uint8_t)(off);
+    if (!uvReadAt(s, off, s_uvFrame + UV_HDR, want)) return false;
+    bool ok = client.publish(s->dstTopic, s_uvFrame, UV_HDR + want);
+    if (!ok) LOG("[UVDBG] ✗ 数据片 @%u (%uB) publish FAIL（缓冲满/ACL？）\n", (unsigned)off, (unsigned)(UV_HDR + want));
+    return true;
+}
+static void uvSendBegin(UvSession* s) {
+    StaticJsonDocument<160> d;
+    d["msg"] = "PV_BEGIN"; d["xferId"] = s->xferId; d["sn"] = g_sn_str;
+    d["size"] = s->size;   d["uid"] = s->uid;
+    char b[160]; size_t n = serializeJson(d, b, sizeof(b));
+    bool ok = client.publish(s->dstTopic, (const uint8_t*)b, (unsigned int)n);
+    // ★DBG：BEGIN 发去哪个主题、publish 成不成（pub=FAIL 常见于 ACL 拦截/缓冲满 → 对端永远收不到 → 无人应答）
+    LOG("[UVDBG] → PV_BEGIN %s xferId=%u size=%u pub=%s\n",
+        s->dstTopic, (unsigned)s->xferId, (unsigned)s->size, ok ? "OK" : "FAIL");
+}
+static void uvSendEnd(UvSession* s) {
+    StaticJsonDocument<64> d; d["msg"] = "PV_END"; d["xferId"] = s->xferId;
+    char b[64]; size_t n = serializeJson(d, b, sizeof(b));
+    bool ok = client.publish(s->dstTopic, (const uint8_t*)b, (unsigned int)n);
+    LOG("[UVDBG] → PV_END %s xferId=%u pub=%s\n", s->dstTopic, (unsigned)s->xferId, ok ? "OK" : "FAIL");
+}
+
+// 会话收尾。App：成功=删槽；失败=不删（留槽等下次 PULL），并停本轮 pull。Peer：只放 PSRAM，不动槽。
+static void uvStop(UvSession* s, const char* why, bool ok) {
+    if (s->kind == UV_APP) {
+        if (s_uvAppFile) s_uvAppFile.close();
+        if (ok && s->slot >= 0) {
+            char p[24]; snprintf(p, sizeof(p), VOICE_PATH_FMT, s->slot);
+            LittleFS.remove(p);
+            if (s->slot < VOICE_MAX) s_slotUid[s->slot] = 0;   // 释放 uid → 该槽下条新语音拿全新 uid
+            LOG("[UV] App 槽 %d 已送达，删除\n", s->slot);
+        } else if (!ok) {
+            g_pullVoiceReq = false;   // 失败：不删、停本轮拉取，等 App 下次 PULL 再从最旧槽重发
         }
-        total += n;
-        client.loop();
-        vTaskDelay(pdMS_TO_TICKS(6));   // 放慢一点，避免 Serverless broker 限速丢片
-        esp_task_wdt_reset();           // 发大文件不回主循环，这里喂狗（未订阅则空操作）
+        g_voiceSendingId = -1;
+    } else {  // UV_PEER
+        if (s->snap) { free(s->snap); s->snap = nullptr; }   // 释放快照；成功/失败都不动槽
     }
-    f.close();
+    s->state = UVS_IDLE;
+    s->slot  = -1;
 
-    StaticJsonDocument<64> e;
-    e["msg"] = "VOICE_END";
-    e["id"]  = slot;
-    char je[64]; serializeJson(e, je, sizeof(je));
-    if (!client.publish(topic, je)) {
-        LOG("[VOICE] ✗ VOICE_END 发送失败，中止槽 %d 待重传\n", slot);
-        return false;
+    // LCD 收尾（两路协调）：另一路仍在传（或还有待拉取语音）则保持转圈，等它统一定妆，避免闪烁。
+    bool otherBusy = (s->kind == UV_APP)
+        ? (s_uvPeer.state != UVS_IDLE)
+        : (s_uvApp.state  != UVS_IDLE || g_pullVoiceReq);
+    if (!otherBusy) {
+        if (ok)                   g_xferAnim = 2;   // 打勾（drawXferAnim 播完自动回 0）
+        else if (g_xferAnim == 1) g_xferAnim = 0;   // 撤转圈
     }
-    LOG("[VOICE] 已发送槽 %d：%u 字节 → %s\n", slot, (unsigned)total, topic);
+    LOG("[UV] %s %s（%s）xferId=%u\n", s->kind == UV_APP ? "App" : "伙伴",
+        ok ? "完成" : "中止", why, (unsigned)s->xferId);
+}
+
+// 启动 App 会话：直接读槽文件（不快照，省 PSRAM；本端删槽前不会被别处删）。返回 false=打不开/空。
+static bool uvStartApp(int slot) {
+    char path[24]; snprintf(path, sizeof(path), VOICE_PATH_FMT, slot);
+    s_uvAppFile = LittleFS.open(path, FILE_READ);
+    if (!s_uvAppFile) { LOG("[UV] App 打不开槽 %d\n", slot); return false; }
+    uint32_t sz = s_uvAppFile.size();
+    if (sz == 0) { s_uvAppFile.close(); return false; }
+    s_uvApp.slot     = slot;
+    s_uvApp.uid      = slotUid(slot);
+    s_uvApp.snap     = nullptr;
+    s_uvApp.size     = sz;
+    s_uvApp.xferId   = esp_random() | 1u;
+    s_uvApp.next     = 0;
+    s_uvApp.sent     = 0;
+    s_uvApp.retry    = 0;
+    s_uvApp.startMs  = millis();
+    s_uvApp.lastRxMs = millis();
+    s_uvApp.deadline = millis() + UV_STEP_TIMEOUT_MS;
+    s_uvApp.state    = UVS_WAIT_READY;
+    snprintf(s_uvApp.dstTopic, sizeof(s_uvApp.dstTopic), "%s", voicePubAddr);  // term/<sn>/voice
+    g_voiceSendingId = slot;
+    if (g_xferAnim != 1) g_xferAnim = 1;   // 转圈；powerManagerLoop 据此保持屏亮/满频
+    uvSendBegin(&s_uvApp);
+    LOG("[UV] ▶ 发 App 槽 %d（xferId=%u size=%u）\n", slot, (unsigned)s_uvApp.xferId, (unsigned)sz);
     return true;
 }
 
-// 发给 App 的一条语音（term/<sn>/voice，带 ack 后删文件）
-static bool sendVoiceFile(int slot) { return sendVoiceFileTo(slot, voicePubAddr); }
+// 启动 Peer 会话（NEW_VOICE 触发）：整条快照进 PSRAM（发送期不持文件句柄，App 路径删同槽也不受影响）。
+static void uvStartPeer(int slot, const String& peer) {
+    if (s_uvPeer.state != UVS_IDLE) { LOG("[UV] 伙伴会话忙，跳过本条\n"); return; }
+    if (xferState != XFER_IDLE)     { LOG("[UV] 下载/传输中，暂不推伙伴\n"); return; }
+    if (peer.isEmpty() || !g_peerOnline) { LOG("[UV] 伙伴离线/未绑，不推\n"); return; }
+    char path[24]; snprintf(path, sizeof(path), VOICE_PATH_FMT, slot);
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) { LOG("[UV] 伙伴打不开槽 %d\n", slot); return; }
+    uint32_t sz = f.size();
+    if (sz == 0) { f.close(); return; }
+    uint8_t* data = (uint8_t*)ps_malloc(sz);
+    if (!data) { f.close(); LOG("[UV] ✗ PSRAM 分配失败(%u)\n", (unsigned)sz); return; }
+    int rd = f.read(data, sz); f.close();
+    if (rd < 0 || (uint32_t)rd != sz) { free(data); LOG("[UV] ✗ 读槽 %d 不全\n", slot); return; }
+    s_uvPeer.slot     = slot;
+    s_uvPeer.uid      = slotUid(slot);
+    s_uvPeer.snap     = data;
+    s_uvPeer.size     = sz;
+    s_uvPeer.xferId   = esp_random() | 1u;
+    s_uvPeer.next     = 0;
+    s_uvPeer.sent     = 0;
+    s_uvPeer.retry    = 0;
+    s_uvPeer.startMs  = millis();
+    s_uvPeer.lastRxMs = millis();
+    s_uvPeer.deadline = millis() + UV_STEP_TIMEOUT_MS;
+    s_uvPeer.state    = UVS_WAIT_READY;
+    snprintf(s_uvPeer.dstTopic, sizeof(s_uvPeer.dstTopic), "dev/%s/voicePlay", topicId(peer).c_str());
+    if (g_xferAnim != 1) g_xferAnim = 1;
+    uvSendBegin(&s_uvPeer);
+    LOG("[UV] ▶ 推伙伴 %s 槽 %d（xferId=%u size=%u）\n",
+        peer.c_str(), slot, (unsigned)s_uvPeer.xferId, (unsigned)sz);
+}
+
+// 填满发送窗口：从 sent 处连发到 (next + 窗口) 或 size 为止。返回 false=读源失败(已收手)。
+//   稳态下每收到一个累积 ACK、窗口左沿右移，这里就补发新腾出的额度 → 由接收端 ACK 节奏时钟化限速。
+static bool uvFillWindow(UvSession* s) {
+    uint32_t before = s->sent;
+    int burst = 0;
+    while (s->sent < s->size && (s->sent - s->next) < (uint32_t)UV_WINDOW_BYTES
+           && burst < UV_MAX_SEND_PER_PUMP) {          // ★每轮限发 UV_MAX_SEND_PER_PUMP 片（防猛发丢片）
+        uint32_t remain = s->size - s->sent;
+        uint32_t len = remain < (uint32_t)UV_CHUNK ? remain : (uint32_t)UV_CHUNK;
+        if (!uvSendChunk(s, s->sent)) { uvStop(s, "读源失败", false); return false; }
+        s->sent += len;
+        burst++;
+    }
+    if (s->sent > before)
+        LOG("[UVDBG] → 数据 %s [%u..%u) acked=%u/%u\n", s->kind == UV_APP ? "App" : "伙伴",
+            (unsigned)before, (unsigned)s->sent, (unsigned)s->next, (unsigned)s->size);
+    return true;
+}
+
+// webTask 每轮推进单个会话（Go-Back-N 滑动窗口）：
+//   断链/总超时/存活/握手 兜底 + 填窗口 + 全确认后发 END + 停滞回退重发。
+static void uvPump(UvSession* s) {
+    if (s->state == UVS_IDLE) return;
+    uint32_t now = millis();
+    if (!client.connected()) { uvStop(s, "断链", false); return; }
+    if ((int32_t)(now - (s->startMs + UV_TOTAL_TIMEOUT_MS)) >= 0) { uvStop(s, "总超时", false); return; }
+    if (s->state == UVS_WAIT_READY) {
+        // 开传前握手窗口：前台等这么久还没人应答 BEGIN → 收手（App 留槽等下次 PULL；伙伴丢弃）
+        if ((int32_t)(now - (s->startMs + UV_HANDSHAKE_MS)) >= 0) { uvStop(s, "无人应答", false); return; }
+    } else {
+        // 传输期：ACK 本身就是存活信号；连续这么久毫无回程 → 判对端不在 → 收手
+        if ((int32_t)(now - (s->lastRxMs + UV_LIVENESS_MS)) >= 0) { uvStop(s, "对端无响应", false); return; }
+    }
+    switch (s->state) {
+        case UVS_SENDING:
+            if (!uvFillWindow(s)) break;                 // 读源失败已收手
+            if (s->next >= s->size) {                    // 全部数据已被【确认】 → 发 END 等 DONE
+                uvSendEnd(s); s->state = UVS_WAIT_DONE; s->retry = 0; s->deadline = now + UV_STEP_TIMEOUT_MS;
+                break;
+            }
+            // 停滞重传：deadline 到（累积 ACK 一直无进展）→ Go-Back-N 回退到已确认处，重发整窗
+            if ((int32_t)(now - s->deadline) >= 0) {
+                if (++s->retry > UV_STEP_MAX_RETRY) { uvStop(s, "重试超限", false); break; }
+                LOG("[UV] 停滞回退重发 @%u（xferId=%u）\n", (unsigned)s->next, (unsigned)s->xferId);
+                s->sent = s->next;                       // 回退窗口右沿到左沿
+                s->deadline = now + UV_STEP_TIMEOUT_MS;
+                uvFillWindow(s);                         // 立即重发窗口
+            }
+            break;
+        case UVS_WAIT_READY:   // 等 BEGIN 应答
+        case UVS_WAIT_DONE:    // 全部已确认+已发 END，等整条 DONE
+            if ((int32_t)(now - s->deadline) >= 0) {
+                if (++s->retry > UV_STEP_MAX_RETRY) { uvStop(s, "重试超限", false); break; }
+                if (s->state == UVS_WAIT_READY) uvSendBegin(s);
+                else                            uvSendEnd(s);
+                s->deadline = now + UV_STEP_TIMEOUT_MS;
+            }
+            break;
+        default: break;
+    }
+}
+
+// ── 回程处理（在 dispatchCommand 里按 xferId 找到会话后调用，与 webTask 同任务，无需加锁）──
+//   ackNext = 接收端已连续收到的字节数（累积确认）。滑动窗口据此右移窗口左沿。
+static void uvOnAck(UvSession* s, uint32_t xferId, uint32_t ackNext) {
+    if (s->state == UVS_IDLE || xferId != s->xferId) return;
+    s->lastRxMs = millis();
+    if (s->state == UVS_WAIT_READY) {
+        // BEGIN 就绪：从对端期望处起（通常 0；对端有残留半收态则从残留续）
+        s->next = ackNext; s->sent = ackNext;
+        s->state = UVS_SENDING; s->retry = 0; s->deadline = millis() + UV_STEP_TIMEOUT_MS;
+    } else if (s->state == UVS_SENDING) {
+        if (ackNext > s->next) {                 // 累积确认推进 → 滑窗（左沿右移）+ 重置停滞计时
+            s->next = ackNext; s->retry = 0; s->deadline = millis() + UV_STEP_TIMEOUT_MS;
+            // 新腾出的窗口额度由下一轮 uvPump 的 uvFillWindow 补发
+        }
+        // ackNext <= next：重复/滞后 ACK，忽略
+    } else if (s->state == UVS_WAIT_DONE) {
+        if (ackNext < s->size) {                 // 发了 END 但对端仍缺（END 丢/收不全）→ 回退续发
+            s->next = ackNext; s->sent = ackNext;
+            s->state = UVS_SENDING; s->retry = 0; s->deadline = millis() + UV_STEP_TIMEOUT_MS;
+        }
+    }
+}
+static void uvOnDone(UvSession* s, uint32_t xferId) { if (s->state != UVS_IDLE && xferId == s->xferId) { s->lastRxMs = millis(); uvStop(s, "DONE", true);  } }
+static void uvOnFail(UvSession* s, uint32_t xferId) { if (s->state != UVS_IDLE && xferId == s->xferId) uvStop(s, "对端 FAIL", false); }
+static void uvOnBusy(UvSession* s, uint32_t xferId) { if (s->state != UVS_IDLE && xferId == s->xferId) uvStop(s, "对端忙/勿扰", false); }
+
+// 回程按 xferId 找活跃会话（只两个，直接比对）
+static UvSession* uvByXfer(uint32_t xferId) {
+    if (s_uvApp.state  != UVS_IDLE && s_uvApp.xferId  == xferId) return &s_uvApp;
+    if (s_uvPeer.state != UVS_IDLE && s_uvPeer.xferId == xferId) return &s_uvPeer;
+    return nullptr;
+}
 
 // 找最新（编号最大）的已存语音槽 = 刚录的那条；没有返回 -1
 static int findLatestVoiceSlot() {
@@ -929,14 +1152,13 @@ static int findLatestVoiceSlot() {
 }
 
 // ══════════════════════════════════════════════════════════════
-//  P4 伙伴语音：应用层逐片确认可靠传输（stop-and-wait ARQ over QoS0）
-//    发送 A → dev/<topicId(B)>/voicePlay：PV_BEGIN → 数据帧(带 offset) → PV_END
-//    确认 B → dev/<topicId(A)>/cmd       ：PV_ACK{next} / PV_DONE / PV_FAIL / PV_BUSY
-//  · A 收到 B 对 offset O 的 PV_ACK{next=O+L} 才发下一片 → 天然限速到 B 的处理速度，
-//    从源头避免"慢订阅→broker 丢 QoS0"；残余丢片靠单片超时重发兜住。
-//  · 每片带 xferId+offset：B 按 offset 幂等落位（重复片不重写、乱序片不误写）。
-//  · 三类超时：单步 ack 超时(重发)、整条总超时、接收侧无活动超时(放弃半收态)。
-//  App 路径(term/<sn>/voice, sendVoiceFileTo)完全不动，此处是独立的设备↔设备协议。
+//  伙伴语音【接收端】：本机作为接收方，收伙伴推来的语音（stop-and-wait ARQ over QoS0）
+//    发送方 A → dev/<topicId(本机)>/voicePlay：PV_BEGIN → 数据帧(带 offset) → PV_END
+//    本机确认  → dev/<topicId(A)>/cmd         ：PV_ACK{next} / PV_DONE / PV_FAIL / PV_BUSY
+//  · 每片带 xferId+offset：按 offset 幂等落位（重复片不重写、乱序片不误写）。
+//  · 收齐即播即删；两类超时：整条去重窗口、接收侧无活动超时(放弃半收态)。
+//  发送端（本机→App / 本机→伙伴）已统一为上方的 UVA 引擎（s_uvApp/s_uvPeer），
+//  与本接收端共用同一套 PV_* 帧格式；App 端也说这套（见 App voice_service.dart）。
 // ══════════════════════════════════════════════════════════════
 #define PV_CHUNK            4000      // 每片数据字节（+9 头 < 4096，远小于 MQTT 缓冲 8192）
 #define PV_HDR              9         // 数据帧头：1(magic)+4(xferId,BE)+4(offset,BE)
@@ -950,20 +1172,8 @@ static int findLatestVoiceSlot() {
 #define PEER_VOICE_TMP   "/peer_voice.mp3.tmp"
 #define PEER_VOICE_PATH  "/peer_voice.mp3"
 
-// ── 发送端(A)状态机 ──
-enum PvSendState { PVS_IDLE, PVS_WAIT_READY, PVS_SEND, PVS_WAIT_ACK, PVS_WAIT_DONE };
-static PvSendState s_pvsState   = PVS_IDLE;
-static String   s_pvsPeer;                 // 伙伴 SN（仅日志）
-static char     s_pvsTopic[64]  = {0};     // dev/<topicId(peer)>/voicePlay
-static uint32_t s_pvsXferId     = 0;
-static uint8_t* s_pvsData       = nullptr; // PSRAM：整条语音快照（发送期不依赖文件句柄，App 路径可随时删该槽）
-static uint32_t s_pvsSize       = 0;
-static uint32_t s_pvsNext       = 0;       // 当前在途片 offset（= B 期望的下一个 offset）
-static uint8_t* s_pvsFrame      = nullptr; // PSRAM：[magic|xferId|offset|data]
-static uint32_t s_pvsFrameLen   = 0;       // 当前 frame 总字节（含头）——超时原样重发
-static uint32_t s_pvsDeadline   = 0;
-static int      s_pvsRetry      = 0;
-static uint32_t s_pvsStartMs    = 0;
+// ── 发送端已合并为上方统一引擎（s_uvApp / s_uvPeer）；以下仅保留【接收端】：本机作为
+//    伙伴语音的接收方（dev/<sn>/voicePlay），即播即删。──
 
 // ── 接收端(B)状态机 ──
 static File     s_pvRxFile;
@@ -974,146 +1184,6 @@ static uint32_t s_pvRxNext      = 0;       // 已连续收到字节 = 下一个�
 static uint32_t s_pvRxLastMs    = 0;
 static uint32_t s_pvRxDoneId    = 0;       // 最近完成的 xferId（整条去重）
 static uint32_t s_pvRxDoneMs    = 0;
-
-// P4 传输进行中（发送或接收）——webTask 据此把轮询提速到 5ms、WiFi 拉满功率，
-// 否则 L2(500ms 轮询 + WiFi 省电 DTIM)下逐片往返会很慢，长语音甚至撞总超时。
-static inline bool peerVoiceActive() { return s_pvsState != PVS_IDLE || s_pvRxXferId != 0; }
-
-// App 语音上传路径是否在忙（拉取中或正发某条等 ack）——与 P4 协调 g_xferAnim：
-// 录音时两路(发 App + 推伙伴)常并发，只有对方也空闲才打勾，否则留转圈给对方收尾，避免闪烁。
-static inline bool appVoiceBusy() { return g_pullVoiceReq || g_voiceSendingId >= 0; }
-
-// ── 发送端：组一片数据帧并发出（offset 处读 PV_CHUNK 字节）。返回 false=读文件失败 ──
-static bool pvsSendChunk(uint32_t offset)
-{
-    if (!s_pvsData || !s_pvsFrame || offset > s_pvsSize) return false;
-    uint32_t remain = s_pvsSize - offset;
-    uint32_t want   = (remain < (uint32_t)PV_CHUNK) ? remain : (uint32_t)PV_CHUNK;
-    s_pvsFrame[0] = PV_MAGIC;
-    s_pvsFrame[1] = (uint8_t)(s_pvsXferId >> 24); s_pvsFrame[2] = (uint8_t)(s_pvsXferId >> 16);
-    s_pvsFrame[3] = (uint8_t)(s_pvsXferId >> 8);  s_pvsFrame[4] = (uint8_t)(s_pvsXferId);
-    s_pvsFrame[5] = (uint8_t)(offset >> 24);      s_pvsFrame[6] = (uint8_t)(offset >> 16);
-    s_pvsFrame[7] = (uint8_t)(offset >> 8);       s_pvsFrame[8] = (uint8_t)(offset);
-    memcpy(s_pvsFrame + PV_HDR, s_pvsData + offset, want);
-    s_pvsFrameLen = PV_HDR + want;
-    client.publish(s_pvsTopic, s_pvsFrame, s_pvsFrameLen);
-    return true;
-}
-static void pvsSendBegin()
-{
-    StaticJsonDocument<128> d;
-    d["msg"] = "PV_BEGIN"; d["xferId"] = s_pvsXferId; d["sn"] = g_sn_str; d["size"] = s_pvsSize;
-    char b[128]; size_t n = serializeJson(d, b, sizeof(b));
-    client.publish(s_pvsTopic, (const uint8_t*)b, (unsigned int)n);
-}
-static void pvsSendEnd()
-{
-    StaticJsonDocument<64> d; d["msg"] = "PV_END"; d["xferId"] = s_pvsXferId;
-    char b[64]; size_t n = serializeJson(d, b, sizeof(b));
-    client.publish(s_pvsTopic, (const uint8_t*)b, (unsigned int)n);
-}
-static void pvsStop(const char* why, bool ok)
-{
-    if (s_pvsData) { free(s_pvsData); s_pvsData = nullptr; }
-    s_pvsState = PVS_IDLE;
-    // LCD 收尾（与 App 上传路径协调）：只有 App 也不忙才由本路径定妆——
-    //   成功→打勾；失败→撤掉转圈。若 App 仍在忙则保持现状(转圈)，等它收尾统一打勾，避免闪烁。
-    if (!appVoiceBusy()) {
-        if (ok)                       g_xferAnim = 2;   // 打勾（drawXferAnim 播完自动回 0）
-        else if (g_xferAnim == 1)     g_xferAnim = 0;   // 失败且当前是本路径的转圈 → 撤掉
-    }
-    LOG("[PVOICE] 发送%s（%s）xferId=%u\n", ok ? "完成" : "中止", why, (unsigned)s_pvsXferId);
-}
-
-// NEW_VOICE 触发：向已绑伙伴可靠推送某槽语音。忙/伙伴离线/打不开则跳过（不影响 App 路径）。
-static void startPeerVoiceSend(int slot, const String& peer)
-{
-    if (s_pvsState != PVS_IDLE) { LOG("[PVOICE] 上一条仍在发，跳过本条\n"); return; }
-    if (xferState != XFER_IDLE) { LOG("[PVOICE] 下载/传输中，暂不推送伙伴语音\n"); return; } // 避免与下载抢资源
-    if (peer.isEmpty()) return;
-    if (!g_peerOnline) { LOG("[PVOICE] 伙伴离线，不推送\n"); return; }   // 预检，省一轮 BEGIN 重试
-    char path[24]; snprintf(path, sizeof(path), VOICE_PATH_FMT, slot);
-    File f = LittleFS.open(path, FILE_READ);
-    if (!f) { LOG("[PVOICE] 打不开槽 %d\n", slot); return; }
-    uint32_t sz = f.size();
-    if (sz == 0) { f.close(); return; }
-    // 一次性快照整条语音进 PSRAM，随即关文件：发送期(数秒)不再持有文件句柄，
-    // App 路径 handleVoiceSend 收 ack 后删同一槽也不会读到已删的打开文件（同由 NEW_VOICE 触发，会重叠）。
-    uint8_t* data = (uint8_t*)ps_malloc(sz);
-    if (!data) { f.close(); LOG("[PVOICE] ✗ PSRAM 分配失败(%u)\n", (unsigned)sz); return; }
-    int rd = f.read(data, sz);
-    f.close();
-    if (rd < 0 || (uint32_t)rd != sz) { free(data); LOG("[PVOICE] ✗ 读槽 %d 不全\n", slot); return; }
-    if (!s_pvsFrame) {
-        s_pvsFrame = (uint8_t*)ps_malloc(PV_HDR + PV_CHUNK);
-        if (!s_pvsFrame) { free(data); LOG("[PVOICE] ✗ PSRAM 分配失败\n"); return; }
-    }
-    s_pvsData   = data;
-    s_pvsPeer   = peer;
-    snprintf(s_pvsTopic, sizeof(s_pvsTopic), "dev/%s/voicePlay", topicId(peer).c_str());
-    s_pvsXferId = esp_random() | 1u;   // 非 0
-    s_pvsSize   = sz;
-    s_pvsNext   = 0;
-    s_pvsRetry  = 0;
-    s_pvsStartMs = millis();
-    s_pvsDeadline = millis() + PV_ACK_TIMEOUT_MS;
-    s_pvsState  = PVS_WAIT_READY;
-    g_xferAnim  = 1;                    // LCD 转圈（推伙伴中）；powerManagerLoop 据此保持亮屏
-    pvsSendBegin();
-    LOG("[PVOICE] ▶ 向伙伴 %s 发送槽 %d（xferId=%u size=%u）\n",
-        peer.c_str(), slot, (unsigned)s_pvsXferId, (unsigned)sz);
-}
-
-// webTask 每轮调用：推进发送状态机（超时重发 / 发下一片 / 总超时兜底）
-static void pumpPeerVoiceSend()
-{
-    if (s_pvsState == PVS_IDLE) return;
-    uint32_t now = millis();
-    if (!client.connected())                                  { pvsStop("断链", false); return; }
-    if ((int32_t)(now - (s_pvsStartMs + PV_TOTAL_TIMEOUT_MS)) >= 0) { pvsStop("总超时", false); return; }
-
-    switch (s_pvsState) {
-        case PVS_SEND:                       // ack 推进后由回调置此态：发下一片 / 或收尾发 END
-            if (s_pvsNext >= s_pvsSize) {
-                pvsSendEnd();
-                s_pvsState = PVS_WAIT_DONE; s_pvsRetry = 0; s_pvsDeadline = now + PV_ACK_TIMEOUT_MS;
-            } else if (!pvsSendChunk(s_pvsNext)) {
-                pvsStop("读文件失败", false);
-            } else {
-                s_pvsState = PVS_WAIT_ACK; s_pvsRetry = 0; s_pvsDeadline = now + PV_ACK_TIMEOUT_MS;
-            }
-            break;
-        case PVS_WAIT_READY:                 // 等 BEGIN 的就绪确认
-        case PVS_WAIT_ACK:                   // 等当前片确认
-        case PVS_WAIT_DONE:                  // 等整条 DONE/FAIL
-            if ((int32_t)(now - s_pvsDeadline) >= 0) {
-                if (++s_pvsRetry > PV_MAX_RETRY) { pvsStop("重试超限", false); break; }
-                if      (s_pvsState == PVS_WAIT_READY) pvsSendBegin();
-                else if (s_pvsState == PVS_WAIT_ACK)   client.publish(s_pvsTopic, s_pvsFrame, s_pvsFrameLen);
-                else                                    pvsSendEnd();
-                s_pvsDeadline = now + PV_ACK_TIMEOUT_MS;
-            }
-            break;
-        default: break;
-    }
-}
-
-// ── 发送端：收到 B 的确认（在 dispatchCommand 里调用，webTask 同任务，无需加锁）──
-static void pvOnAck(uint32_t xferId, uint32_t next)
-{
-    if (s_pvsState == PVS_IDLE || xferId != s_pvsXferId) return;
-    if (s_pvsState == PVS_WAIT_READY) {          // BEGIN 就绪：从 B 期望的 next 开始发
-        s_pvsNext = next; s_pvsState = PVS_SEND;
-    } else if (s_pvsState == PVS_WAIT_ACK) {
-        if (next > s_pvsNext) { s_pvsNext = next; s_pvsState = PVS_SEND; }  // 有进展→发下一片
-        // next <= s_pvsNext：重复/滞后 ack，忽略（超时会重发当前片）
-    } else if (s_pvsState == PVS_WAIT_DONE) {
-        if (next < s_pvsSize) { s_pvsNext = next; s_pvsState = PVS_SEND; }  // B 仍缺数据→回退续发
-    }
-}
-static void pvOnDone(uint32_t xferId) { if (s_pvsState != PVS_IDLE && xferId == s_pvsXferId) pvsStop("DONE", true);  }
-static void pvOnFail(uint32_t xferId) { if (s_pvsState != PVS_IDLE && xferId == s_pvsXferId) pvsStop("FAIL", false); }
-static void pvOnBusy(uint32_t xferId) { if (s_pvsState != PVS_IDLE && xferId == s_pvsXferId) pvsStop("伙伴忙/勿扰", false); }
 
 // ── 接收端：回一条控制帧给发送方（next<0 表示不带 next 字段）──
 static void pvRxTx(const char* msg, uint32_t xferId, int64_t next)
@@ -1225,50 +1295,25 @@ static void checkPeerVoiceRxTimeout()
     }
 }
 
-// webTask 每轮调用：驱动语音发送状态机
-static void handleVoiceSend() {
-    if (xferState != XFER_IDLE) return;   // 与 app→device 传输互斥
-    if (!client.connected()) return;
+// webTask 每轮调用：驱动统一发送引擎（触发 App 会话 + 推进 App/Peer 两会话）。
+static void uvService() {
+    // 下载/接收期暂停语音外发（避免与下行分片抢 QoS0 带宽）；下载 >6s 会让在途会话存活超时收手，安全。
+    if (xferState != XFER_IDLE) { g_voiceSending = uvActive(); return; }
 
-    if (g_voiceSendingId >= 0) {          // 正在等某条的 ack
-        if (g_voiceAcked && g_voiceAckId == g_voiceSendingId) {
-            char p[24]; snprintf(p, sizeof(p), VOICE_PATH_FMT, g_voiceSendingId);
-            LittleFS.remove(p);
-            if (g_voiceSendingId >= 0 && g_voiceSendingId < VOICE_MAX)
-                s_slotUid[g_voiceSendingId] = 0;   // 释放 uid → 该槽下条新语音拿全新 uid
-            LOG("[VOICE] 槽 %d 已送达，删除\n", g_voiceSendingId);
-            g_voiceSendingId = -1;
-            g_voiceAcked = false;
-            // 本条完成，继续往下尝试发下一条（不再 return，尽快清空队列）
-        } else if ((int32_t)(millis() - g_voiceAckDeadline) >= 0) {
-            LOG("[VOICE] 槽 %d 等 ack 超时，保留待重传\n", g_voiceSendingId);
-            g_voiceSendingId = -1;        // 不删，下次 PULL 再发
-        } else {
-            g_voiceSending = true;        // 仍在等 ack，保持高性能
-            return;
+    // 触发 App 会话：有拉取请求且 App 会话空闲 → 取最旧槽开发；发完一条(DONE→删槽)后本轮继续下一条。
+    if (g_pullVoiceReq && s_uvApp.state == UVS_IDLE && client.connected()) {
+        int slot = findStoredVoiceSlot();
+        if (slot < 0) {                       // 全部发完
+            g_pullVoiceReq = false;
+            if (g_xferAnim == 1 && s_uvPeer.state == UVS_IDLE) g_xferAnim = 2;  // 打勾（伙伴也不在传时）
+        } else if (!uvStartApp(slot)) {
+            g_pullVoiceReq = false;           // 该槽打不开/为空 → 停本轮，避免每轮重试成紧循环
         }
     }
 
-    if (!g_pullVoiceReq) { g_voiceSending = false; return; }
-
-    int slot = findStoredVoiceSlot();
-    if (slot < 0) {                       // 全部发完
-        g_pullVoiceReq = false; g_voiceSending = false;
-        // 打勾：仅当 P4 推伙伴也不在传时才定妆，否则留转圈给 P4 收尾（避免一方未完就打勾闪烁）
-        if (g_xferAnim == 1 && !peerVoiceActive()) g_xferAnim = 2;
-        return;
-    }
-
-    g_voiceSending = true;                // ★ 发大文件前抬性能：CPU 满频 + WiFi 满功率
-    if (g_xferAnim != 1) g_xferAnim = 1;  // ★ 开始/进行语音上传 → LCD 转圈
-    if (!sendVoiceFile(slot)) {
-        // 中途断链/缓冲满：不进等待态，保留 g_pullVoiceReq，下轮（连上后）重试本槽
-        LOG("[VOICE] 槽 %d 发送中断，保留请求下轮重试\n", slot);
-        return;                           // 保持 g_voiceSending=true，下轮重试
-    }
-    g_voiceSendingId   = slot;
-    g_voiceAcked       = false;
-    g_voiceAckDeadline = millis() + 15000;
+    uvPump(&s_uvApp);
+    uvPump(&s_uvPeer);
+    g_voiceSending = uvActive();   // 供 powerManagerLoop 保 CPU 满频 + applyWifiPowerSave 满功率
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -1400,11 +1445,27 @@ static void dispatchCommand(const char* msg, JsonDocument& doc)
     if (strcmp(msg, "BIND") == 0)   { handleBind(doc);   return; }
     if (strcmp(msg, "UNBIND") == 0) { handleUnbind(doc); return; }
 
-    // ── P4 伙伴语音 ARQ：伙伴回来的确认帧 → 推进本机发送状态机 ──
-    if (strcmp(msg, "PV_ACK")  == 0) { pvOnAck (doc["xferId"] | 0u, doc["next"] | 0u); return; }
-    if (strcmp(msg, "PV_DONE") == 0) { pvOnDone(doc["xferId"] | 0u); return; }
-    if (strcmp(msg, "PV_FAIL") == 0) { pvOnFail(doc["xferId"] | 0u); return; }
-    if (strcmp(msg, "PV_BUSY") == 0) { pvOnBusy(doc["xferId"] | 0u); return; }
+    // ── 统一语音 ARQ 回程（App 或伙伴发来）：按 xferId 路由到对应发送会话推进 ──
+    //   App 用 mqtt_client 发的这些回程可为 QoS1（更稳）；伙伴用 PubSubClient=QoS0。引擎两者通吃。
+    if (strcmp(msg, "PV_ACK") == 0 || strcmp(msg, "PV_DONE") == 0 ||
+        strcmp(msg, "PV_FAIL") == 0 || strcmp(msg, "PV_BUSY") == 0) {
+        uint32_t x = doc["xferId"] | 0u; uint32_t nx = doc["next"] | 0u;
+        UvSession* s = uvByXfer(x);
+        // ★DBG：收到的回程 xferId 匹配了哪个会话？不匹配是"无人应答"的常见根因（对比下方当前会话 xferId）
+        LOG("[UVDBG] ← %s xferId=%u next=%u → %s\n", msg, (unsigned)x, (unsigned)nx,
+            s ? (s->kind == UV_APP ? "命中 App 会话" : "命中 伙伴会话") : "★无匹配会话，丢弃★");
+        if (!s)
+            LOG("[UVDBG]   当前会话: App{xferId=%u state=%d} 伙伴{xferId=%u state=%d}\n",
+                (unsigned)s_uvApp.xferId,  (int)s_uvApp.state,
+                (unsigned)s_uvPeer.xferId, (int)s_uvPeer.state);
+        if (s) {
+            if      (strcmp(msg, "PV_ACK")  == 0) uvOnAck(s, x, nx);
+            else if (strcmp(msg, "PV_DONE") == 0) uvOnDone(s, x);
+            else if (strcmp(msg, "PV_FAIL") == 0) uvOnFail(s, x);
+            else                                  uvOnBusy(s, x);
+        }
+        return;
+    }
 
     // ── 伙伴送达回执 → 转给 App 显示"已送达"（PEER_ACK 不在 EMQX 推送白名单，不触发推送）──
     if (strcmp(msg, "POKE_ACK") == 0 || strcmp(msg, "VOICE_ACK") == 0) {
@@ -1451,16 +1512,11 @@ static void dispatchCommand(const char* msg, JsonDocument& doc)
         return;
     }
 
-    // ── PULL_VOICE / VOICE_OK：语音消息拉取与确认（阶段D）──
+    // ── PULL_VOICE：App 请求拉取本机已存语音 → uvService 逐条 ARQ 发出（成功=PV_DONE 删槽）──
+    //   （旧的整条 VOICE_OK 确认已废弃，改由统一 ARQ 的 PV_ACK/PV_DONE 逐片确认，见上面回程路由）
     if (strcmp(msg, "PULL_VOICE") == 0) {
         g_pullVoiceReq = true;
         LOG("[VOICE] 收到 App 拉取请求\n");
-        return;
-    }
-    if (strcmp(msg, "VOICE_OK") == 0) {
-        g_voiceAckId = doc["id"] | -1;
-        g_voiceAcked = true;
-        LOG("[VOICE] 收到 App 确认 id=%d\n", g_voiceAckId);
         return;
     }
 
@@ -1849,8 +1905,8 @@ static void applyWifiPowerSave()
     bool xfering = (xferState != XFER_IDLE);
 
     wifi_ps_type_t want;
-    if (xfering || g_posStreaming || g_voiceSending || peerVoiceActive())
-                                    want = WIFI_PS_NONE;        // 下载/串流/语音上行/伙伴语音 满功率
+    if (xfering || g_posStreaming || uvActive() || s_pvRxXferId != 0)
+                                    want = WIFI_PS_NONE;        // 下载/串流/语音发送(App或伙伴)/收伙伴语音 满功率
     else                            want = WIFI_PS_MIN_MODEM;   // ★ L0/L1/L2 统一 MIN_MODEM（原 L2 的 MAX 去掉）
 
     if (want != cur) {
@@ -2051,11 +2107,11 @@ void webTask(void *webParameter)
                 String terminal = Config.getString("terminal", "");
                 LOG("[VOICE] 新语音，terminal=%s\n", terminal.c_str());
                 publishCmdToTerminal(terminal, "NEW_VOICE");
-                // P4：若已绑定，把刚录的语音也推给伙伴即播（决策④ 都进）
+                // 若已绑定，把刚录的语音也推给伙伴即播（统一 ARQ 的 Peer 会话）
                 String peer = Config.getString("peerSn", "");
                 if (!peer.isEmpty()) {
                     int slot = findLatestVoiceSlot();
-                    if (slot >= 0) startPeerVoiceSend(slot, peer);
+                    if (slot >= 0) uvStartPeer(slot, peer);
                 }
             }
             else if (strcmp(webMsg, "POKE_PEER") == 0) {
@@ -2102,6 +2158,14 @@ void webTask(void *webParameter)
         //   快速排空。上限 8 防极端洪流饿死本循环其余工作(pos/落盘/心跳)；available()>0
         //   才继续 → 只在确有缓冲数据时多跑，readByte 不会空转忙等。
         for (int i = 0; i < 8; i++) {
+            // ★ 必须在循环【内】喂狗：client.loop() 单次最坏会阻塞 setSocketTimeout(3) 整整
+            //   3 秒——PubSubClient 的 readByte 在包只收到一半时会等剩余字节，而传输大分片
+            //   时 TLS 半包是常态。本循环最多 8 次 ⇒ 最坏 24s，远超 TWDT 的 5s，实测已因此
+            //   panic 过（"WEBTask (CPU 0) did not reset the watchdog"）。
+            //   下面那句 available() 判断在两次调用【之间】，挡不住单次调用进去阻塞。
+            //   这里喂狗是安全的：每次 client.loop() 都被 socketTimeout 有界兜住，不是死循环；
+            //   真的 App 掉线由下方 XFER_RX_TIMEOUT_MS 那段接收看门狗负责判定。
+            if (wdtSubscribed) esp_task_wdt_reset();
             if (!client.loop()) break;               // 断连即止
             if (espClient.available() <= 0) break;   // 无更多缓冲数据即止
         }
@@ -2224,11 +2288,10 @@ void webTask(void *webParameter)
             }
         }
 
-        // ── 语音消息发送（App 拉取时逐条发 term/<sn>/voice，收 ack 后删）──
-        handleVoiceSend();
+        // ── 统一语音 ARQ 发送引擎：触发 App 会话 + 推进 App/Peer 两会话（逐片确认可靠传）──
+        uvService();
 
-        // ── P4 伙伴语音 ARQ：推进发送状态机 + 接收侧无活动超时兜底 ──
-        pumpPeerVoiceSend();
+        // ── 接收侧（本机作为伙伴语音接收方）无活动超时兜底 ──
         checkPeerVoiceRxTimeout();
 
         // ── 勿扰态缓存（每 2s 刷新）：供 powerManagerLoop 判断"勿扰时下载不亮屏"。
@@ -2248,7 +2311,7 @@ void webTask(void *webParameter)
         // ── 轮询节奏：传输全速 / 串流低延迟 / L2 拉长喂 light-sleep / L0L1 低延迟 ──
         TickType_t pollTicks;
         if      (xfering)            pollTicks = 1;                          // 传输：全速
-        else if (peerVoiceActive())  pollTicks = pdMS_TO_TICKS(5);           // P4 伙伴语音：低延迟（逐片往返快）
+        else if (uvActive() || s_pvRxXferId != 0) pollTicks = pdMS_TO_TICKS(5); // 语音 ARQ 收发：低延迟（逐片往返快）
         else if (g_posStreaming)     pollTicks = pdMS_TO_TICKS(5);           // 串流：低延迟
         else if (g_pwrTier == 2)     pollTicks = pdMS_TO_TICKS(WEB_L2_POLL_MS); // L2：省电（推送仍≤1s）
         else                         pollTicks = pdMS_TO_TICKS(100);         // L0/L1：低延迟

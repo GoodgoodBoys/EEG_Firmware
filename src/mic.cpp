@@ -10,6 +10,8 @@
 #include "esp_task_wdt.h"   // 任务级看门狗：卡死时 panic backtrace 直接点名本任务
 
 // 16kHz 单声道语音，64kbps 音质更干净；30s ≈ 240KB（10 条 2.4MB 够存）
+// ⚠ 试过 128kbps：录音完全没声音（实测）。原因见下方 shine 缓冲区分析——
+//   在改码率前必须先确认 shine 内部帧缓冲放得下该码率的一帧，否则会静默出错。
 #define MP3_BITRATE_KBPS   64
 
 // 最短有效录音时长（ms）：短于此（或编码为空）视为误触/碎录音 → 丢弃，不占槽、不推送。
@@ -42,9 +44,16 @@
 #define MIC_HP_R           0.94f     // ~150Hz 高通（去 47Hz 隆隆等 <200Hz 低频噪声）
 #define MIC_LP_A           1.00f     // 1.0 = 不低通（残留是宽带白噪，低通没用还损音质）
 #define MIC_GATE_TH        600.0f    // 噪声门门限（增益后幅度）；0=关。按设备实测可调
-#define MIC_GATE_FLOOR     0.25f     // 门关时降到 25%（不全静音，避免削小声语音）
+// ★ FLOOR 0.25→0.08：0.25 只把静音段压 12dB，底噪照样透出来——伙伴蛋的小喇叭在
+//   2~6kHz 有谐振峰，正好放大这段嘶声（手机喇叭频响宽 + 有 DSP，所以同一文件在
+//   App 里听不出来）。0.08 ≈ -22dB，静音段基本听不到，仍不是全静音、不会把
+//   小声说话整段切掉。
+#define MIC_GATE_FLOOR     0.08f     // 门关时降到 8%（≈-22dB）
 #define MIC_ENV_A          0.02f
-#define MIC_GATE_SMOOTH    0.03f
+// ★ SMOOTH 0.03→0.008：门压得更深后，开关速度必须放慢，否则语气停顿处会听到
+//   底噪一下一下地"抽气"（pumping）。0.008 @16kHz ≈ 8ms 时间常数，跟得上语句
+//   间隙又不会在音节间抖动。
+#define MIC_GATE_SMOOTH    0.008f
 #define MIC_LIMIT_KNEE     0.80f     // 软限幅拐点：低于此透明，高于此平滑压峰不硬削波（增益提高后抬高拐点，正常说话不被压闷）
 
 struct MicFilt { float hpX1, hpY1, lpS, env, gate; };

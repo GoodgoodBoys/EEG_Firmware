@@ -32,7 +32,10 @@
                             //   + %f 格式化) 同时展开，实测峰值 2568/3072 = 83.6%，余量仅 504 字节
 #define STACK_WEB  10240
 #define STACK_LCD   4096    // 3072→4096：实测峰值 2608/3072 = 84.9%，余量仅 464 字节（JPEG 解码路径）
-#define STACK_AUD  19456
+#define STACK_AUD  24576    // 19456→24576：minimp3 的 mp3dec_decode_frame 解码 scratch 全在栈上，
+                            //   实测峰值 17496/19456 = 89.9%，余量仅 1960 字节。而 Xtensa 的
+                            //   低级中断复用【被打断任务的栈】，audTask 提优先级后跑得更频繁、
+                            //   承接中断的概率也更高，这点余量不够安全。
 #define STACK_MIC   8192
 
 // PCB v3.0 引脚（原理图 alivePCB-v3.0, 2026-07-06）
@@ -810,8 +813,14 @@ void setup() {
     /* LCD 任务（内部 SRAM 栈 — JPEG 解码 + LittleFS 文件读取需要）*/
     ok &= xTaskCreatePinnedToCore(lcdTask, "LcdTask", STACK_LCD, NULL, 1, &xLcdTaskHandle, 0);
 
-    /* AUD 任务（内部 SRAM 栈 — minimp3 解码 ~4KB + 开销；大缓冲在 PSRAM）*/
-    ok &= xTaskCreatePinnedToCore(audTask, "AudTask", STACK_AUD, NULL, 0, &xAudTaskHandle, 1);
+    /* AUD 任务（内部 SRAM 栈 — minimp3 解码 ~4KB + 开销；大缓冲在 PSRAM）
+     * ★ 优先级 0→5：音频是硬实时的，喂不上 I2S 的 DMA 就会重播旧缓冲发出嗡嗡电流声。
+     *   原来的 0 与 IDLE 同级，还被同在 core 1 的 loopTask / persistTask(都是 1) 抢占，
+     *   欠载探针实测 4.6s 里亏空 ~40ms。这里放到全系统最高，安全性来自 audTask 全程
+     *   阻塞式等待（播放中阻塞在 i2s_channel_write 的 DMA 信号量，空闲时 vTaskDelay /
+     *   信号量），没有任何忙等，不会饿死别人；且它独占 core 1，core 0 的
+     *   LCD/IMU/WEB 完全不受影响。 */
+    ok &= xTaskCreatePinnedToCore(audTask, "AudTask", STACK_AUD, NULL, 5, &xAudTaskHandle, 1);
 
     /* MIC 任务（栈含 Shine MP3 编码开销，从 4096 提到 8192）*/
     ok &= xTaskCreatePinnedToCore(micTask, "MicTask", STACK_MIC, NULL, 1, &xMicTaskHandle, 0);

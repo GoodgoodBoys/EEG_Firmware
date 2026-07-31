@@ -22,7 +22,10 @@ extern SemaphoreHandle_t xAudWake;    // L2 唤醒信号量（powerManagerLoop �
 #define AUD_L2_BLOCK_MS   500         // L2 最长阻塞 = light-sleep 单次时长上限
 
 // ─── I2S 配置 ─────────────────────────────────────────────
-#define I2S_DMA_BUF_CNT   4
+// ★ dma_desc_num 4→8：环深 = 8×512 帧，44.1kHz 下约 93ms、16kHz 下约 256ms。
+//   这是喂数抖动的容忍窗口——audTask 被打断超过这个时长，DMA 就会重播旧缓冲发出
+//   嗡嗡声。原来的 4 个描述符在 44.1kHz 下只有 46ms，余量太薄。代价是内部 RAM 8→16KB。
+#define I2S_DMA_BUF_CNT   8
 #define I2S_DMA_BUF_LEN   512
 #define I2S_DEFAULT_RATE  44100
 
@@ -39,9 +42,24 @@ extern SemaphoreHandle_t xAudWake;    // L2 唤醒信号量（powerManagerLoop �
 //  gain = volume/255 * AUD_GAIN_MAX。volume 越大越响；峰值超过拐点用 tanh 平滑压住，
 //  绝不硬削波/int16 回绕（这就是"拉大音量不破音"的关键，取代原来的裸乘法）。
 //  录音源偏小 → 把 volume 往上调即可拉响，安静段被压、响段不破。
-#define AUD_GAIN_MAX       2.2f     // volume=255 时的最大增益（太高会一直触发限幅→发闷/杂，2~2.5 较稳）
-#define VOICE_VOLUME_SCALE 1.0f     // 伙伴语音消息按当前音量的 120% 播放（仅语音，其它音频照旧）
-#define AUD_LIMIT_KNEE     0.60f    // 软限幅拐点：低于此透明直通，高于此 tanh 压峰
+// ★ AUD_GAIN_MAX 由 2.2 降到 1.0（满音量=单位增益，不放大）：
+//   这个源【进来时就已经贴着满幅】——录音端 MIC_GAIN 20 之后还过了一道 micSoftLimit
+//   (拐点 0.8)，出厂峰值就在 0dBFS 附近。播放端再乘 1.7~2.2 倍等于把整个波形推进 tanh
+//   压缩区，同一信号被限幅两次 → 失真很重、响度却上不去，就是"破音但声音不大"。
+//   2.2 是早期"录音源偏小"时代的遗留值，MIC_GAIN 提到 20 后就该跟着降下来。
+//   若降回单位增益后觉得音量不够，正确做法是调 MAX98357A 的 GAIN 脚（模拟增益）或
+//   重新规划录音电平，而不是在已削顶的信号上再加数字增益。
+#define AUD_GAIN_MAX       1.0f     // volume=255 时的增益上限（1.0=不放大，只衰减）
+// 伙伴语音消息的额外增益系数。只在播放语音消息时生效（靠 s_restoreAfterPlay 判定，
+// 它恰好在"伙伴语音加载→播完"期间为 true），App 发来的 DIY 音频不受影响。
+// ★ 2.0：麦克风录音的平均电平天生比手机来的音频低（人声动态大、峰值被 micSoftLimit
+//   压过一道），不补一点会明显偏小。峰值超出的部分由 audSoftLimit 平滑压住，不会硬削波。
+//   ★ 若听到破音就往下调（1.5 / 1.3）——那说明该条录音本身电平已经很高，
+//     2 倍把大半波形推进了 tanh 压缩区（这正是之前 AUD_GAIN_MAX=2.2 时破音的机理）。
+#define VOICE_VOLUME_SCALE 1.5f     // 伙伴语音消息相对当前音量的额外系数
+// 拐点 0.60→0.85：限幅器应当是"极少触发的安全网"，不是音色塑形器。0.60 意味着
+// −4.4dBFS 以上全被压，正常语音大半时间都在压缩区。
+#define AUD_LIMIT_KNEE     0.85f    // 软限幅拐点：低于此透明直通，高于此 tanh 压峰
 
 // 软限幅：|v|≤拐点 透明；>拐点 平滑压向满幅（响而不破，不回绕）
 static inline int16_t audSoftLimit(float v) {
@@ -239,47 +257,64 @@ static void stopPlayback() {
 
 // ★调试开关：1=播放原始直通（不加增益、不软限幅，按解码 PCM 原样输出；仍 mono→stereo，硬件必需），
 //            0=正常增益+软限幅链。测完想恢复就改回 0。
-#define AUD_RAW_PASSTHROUGH  1
+#define AUD_RAW_PASSTHROUGH  0
 
-// 输出一帧到 I2S：应用增益+软限幅；★单声道复制成左右两路（始终立体声输出）。
-// 录音是 mono，MAX98357A 用 I2S 单声道 slot 常出杂音/乱码——这就是"设备播放杂乱、
-// 但同一文件在手机上很干净"的根因。展开：[m0,m1,...] → [m0,m0,m1,m1,...]。
-static void audWriteFrame(int samples, int channels) {
-    int outSamples;
-#if AUD_RAW_PASSTHROUGH
-    // 原始直通：不加增益、不软限幅，解码 PCM 原样送出（音量 = 文件本身电平）。仍做 mono→stereo。
-    if (channels == 1) {
-        for (int i = samples - 1; i >= 0; i--) {
-            int16_t s = s_pcmBuf[i];
-            s_pcmBuf[2 * i]     = s;
-            s_pcmBuf[2 * i + 1] = s;
-        }
-        outSamples = samples * 2;
-    } else {
-        outSamples = samples * channels;   // 立体声原样
+// ─── 输出暂存区（内部 RAM，1KB）────────────────────────────
+//  攒满一小块再送一次，内存恒定且对 DMA 更友好；也避免了在 s_pcmBuf 里原地展开
+//  单声道时"刚好填满、零余量"的隐患。256 帧 @16kHz ≈ 16ms，足够细，不造成写入抖动。
+#define AUD_STAGE_FRAMES  256                     // 每块 256 个立体声帧
+static int16_t s_stage[AUD_STAGE_FRAMES * 2];     // .bss ⇒ 内部 RAM
+static int     s_stageFill = 0;                   // 已填的立体声帧数
+
+// 把暂存块整块交给 I2S。★ 必须循环写：i2s_channel_write 允许【部分写入】，
+//   原来只调一次且不看 written，超时时剩余采样被静默丢掉 → 播放中出现断点。
+static void audStageFlush() {
+    if (s_stageFill <= 0 || !s_i2sTxHandle) { s_stageFill = 0; return; }
+    const uint8_t* p = (const uint8_t*)s_stage;
+    size_t left = (size_t)s_stageFill * 2 * sizeof(int16_t);
+    while (left > 0) {
+        size_t written = 0;
+        if (i2s_channel_write(s_i2sTxHandle, p, left, &written,
+                              pdMS_TO_TICKS(500)) != ESP_OK) break;
+        if (written == 0) break;                  // 超时且一个字节没写进去 → 放弃本块
+        p    += written;
+        left -= written;
     }
-#else
-    // 伙伴语音消息按 120% 音量播放：s_restoreAfterPlay 在"伙伴语音加载→播完"期间为 true，
-    // 恰好标识当前播的是语音消息（audPlayFile 触发）；常规音频(output1.mp3)播放时为 false、不加成。
+    s_stageFill = 0;
+}
+
+static inline void audStagePut(int16_t l, int16_t r) {
+    s_stage[s_stageFill * 2]     = l;
+    s_stage[s_stageFill * 2 + 1] = r;
+    if (++s_stageFill >= AUD_STAGE_FRAMES) audStageFlush();
+}
+
+// 输出一帧到 I2S：增益 + 软限幅 → mono 复制成左右两路 → 分块送出。
+// ★ 始终立体声输出：录音是 mono，MAX98357A 用 I2S 单声道 slot 常出杂音/乱码。
+static void audWriteFrame(int samples, int channels) {
+#if !AUD_RAW_PASSTHROUGH
+    // 伙伴语音消息按 VOICE_VOLUME_SCALE 播放：s_restoreAfterPlay 在"伙伴语音加载→播完"
+    // 期间为 true，恰好标识当前播的是语音消息；常规音频(output1.mp3)为 false、不加成。
     float gain = (s_volume / 255.0f) * AUD_GAIN_MAX;
     if (s_restoreAfterPlay) gain *= VOICE_VOLUME_SCALE;
-    if (channels == 1) {
-        // 反向原地展开成立体声（s_pcmBuf 容量=最大立体声帧，恰好放得下 2N）
-        for (int i = samples - 1; i >= 0; i--) {
-            int16_t s = audSoftLimit(s_pcmBuf[i] * gain);
-            s_pcmBuf[2 * i]     = s;
-            s_pcmBuf[2 * i + 1] = s;
-        }
-        outSamples = samples * 2;
-    } else {
-        int n = samples * channels;
-        for (int i = 0; i < n; i++) s_pcmBuf[i] = audSoftLimit(s_pcmBuf[i] * gain);
-        outSamples = n;
-    }
 #endif
-    size_t written = 0;
-    i2s_channel_write(s_i2sTxHandle, s_pcmBuf, outSamples * sizeof(int16_t),
-                      &written, pdMS_TO_TICKS(200));
+
+    for (int i = 0; i < samples; i++) {
+        int16_t l, r;
+#if AUD_RAW_PASSTHROUGH
+        // 原始直通：不加增益、不软限幅，解码 PCM 原样送出（音量 = 文件本身电平）
+        if (channels == 1) { l = r = s_pcmBuf[i]; }
+        else               { l = s_pcmBuf[2 * i]; r = s_pcmBuf[2 * i + 1]; }
+#else
+        if (channels == 1) { l = r = audSoftLimit(s_pcmBuf[i] * gain); }
+        else {
+            l = audSoftLimit(s_pcmBuf[2 * i]     * gain);
+            r = audSoftLimit(s_pcmBuf[2 * i + 1] * gain);
+        }
+#endif
+        audStagePut(l, r);
+    }
+    audStageFlush();
 }
 
 // ----------------------------------------------------------
@@ -311,6 +346,8 @@ static AudError_t startPlayback() {
         return AUD_ERR_MP3_BEGIN;
     }
 
+    s_stageFill = 0;    // 丢掉上一段可能残留的半块
+
     // ── ② 重建 I2S 总线（接管 BCK/LRCK/DIN，覆盖空闲时的拉低态）──
     if (!initI2S(info.hz, info.channels)) {
         return AUD_ERR_MP3_BEGIN;
@@ -326,8 +363,13 @@ static AudError_t startPlayback() {
     s_filePos  += info.frame_bytes;
     g_isPlaying = true;
 
-    LOG("[AUD] 开始播放(池内): rate=%d ch=%d  缓存=%uKB\n",
-        info.hz, info.channels, (unsigned)(s_fileSize / 1024));
+    // 实际生效的增益一并打出来（排查"声音偏小/破音"时先看这个数，别去猜 volume 存的是多少）。
+    // voice=1 表示这条是伙伴语音、额外乘了 VOICE_VOLUME_SCALE。
+    const float logGain = (s_volume / 255.0f) * AUD_GAIN_MAX *
+                          (s_restoreAfterPlay ? VOICE_VOLUME_SCALE : 1.0f);
+    LOG("[AUD] 开始播放(池内): rate=%dHz ch=%d 缓存=%uKB vol=%d voice=%d gain=%.2f\n",
+        info.hz, info.channels, (unsigned)(s_fileSize / 1024),
+        (int)s_volume, s_restoreAfterPlay ? 1 : 0, (double)logGain);
     return AUD_OK;
 }
 
@@ -366,6 +408,8 @@ static void audDeinitHW() {
 }
 
 static bool audReinitHW() {
+    // 只是把总线接管回来（此时并未播放），真正的速率由下次 startPlayback 按首帧重定
+    s_stageFill = 0;
     bool ok = initI2S(I2S_DEFAULT_RATE, 2);   // 重建总线，接管引脚
     LOG("[AUD] I2S 已重建: %s\n", ok ? "OK" : "FAIL");
     return ok;
@@ -376,7 +420,9 @@ static bool audReinitHW() {
 // ----------------------------------------------------------
 AudError_t audInit() {
     LOG("[AUD] 功放初始化\n");
-    s_volume = Config.getInt("volume", 200);   // 0~255（越大越响，峰值软限幅不破音）
+    // 0~255（越大越响，峰值软限幅不破音）。兜底值引用 CFG_DEF_VOLUME，
+    // 避免和 configSys 的出厂默认分叉（历史上这里写死 200、那边是 64，两边对不上）。
+    s_volume = Config.getInt("volume", CFG_DEF_VOLUME);
 
     pinMode(AUD_SHDN, OUTPUT);
     digitalWrite(AUD_SHDN, LOW);
@@ -392,9 +438,13 @@ AudError_t audInit() {
     // ★ 开机空闲：删 channel + 拉低 BCK/LRCK/DIN + 静音（4.8mA）
     audIdleShutdown();
 
-    // PCM 输出缓冲（常驻 PSRAM）
+    // PCM 解码缓冲（常驻【内部 RAM】，仅 4.6KB）
+    // ★ 从 PSRAM 挪到内部 RAM：minimp3 每帧往这里写 2304 个采样、随后又整块读出去送 I2S，
+    //   是全链路最热的一块。放 PSRAM 有两重代价：① Quad@80MHz 带宽本就有限；
+    //   ② 写 flash 时 cache 被冻结，PSRAM 访问跟着停摆 → 解码直接卡住、DMA 饿死。
+    //   600KB 文件池继续留在 PSRAM（顺序读，且大到放不进内部 RAM）。
     s_pcmBuf = (int16_t*)heap_caps_malloc(
-        PCM_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        PCM_BUF_SAMPLES * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s_pcmBuf) {
         LOG("[AUD] PCM 缓冲分配失败！\n");
         return AUD_ERR_I2S_INIT;
@@ -435,7 +485,7 @@ void audTask(void* param) {
                     newPlayReq = true;
                     break;
                 case AUD_CFG_UPDATE:
-                    s_volume = Config.getInt("volume", 200);
+                    s_volume = Config.getInt("volume", CFG_DEF_VOLUME);
                     LOG("[AUD] 音量更新: %d\n", s_volume);
                     break;
                 case AUD_STOP:
