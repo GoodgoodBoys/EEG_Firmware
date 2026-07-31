@@ -26,8 +26,8 @@
 #define CFG_DEF_SSID          ""
 #define CFG_DEF_PASSWORD      ""
 #define CFG_DEF_MATCHCODE     "000000"
-#define CFG_DEF_BRIGHTNESS    150
-#define CFG_DEF_VOLUME        100
+#define CFG_DEF_BRIGHTNESS    128
+#define CFG_DEF_VOLUME        64
 
 // ============================================================
 // JSON 文档大小

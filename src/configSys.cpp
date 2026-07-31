@@ -300,11 +300,15 @@ void ConfigManager::setupBLE(const char* name) {
 
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(BLE_SERVICE_UUID);
-    // ★ setScanResponse → setScanResponseData(空) 或直接不调用
-    // adv->setScanResponseData(NimBLEAdvertisementData());  // 可选
+    // ★ 把设备名 EGG_<SN> 放进【扫描响应】：主广播包 31 字节已被 128-bit Service UUID
+    //   占满（flags 3B + UUID 18B = 21B，放不下 12+ 字节的名字），故开启扫描响应承载名字。
+    //   这样 App 扫描到设备即可从广播名解析出 SN，在"查询到设备"弹窗里显示供用户核对。
+    //   注意顺序：enableScanResponse(true) 必须先于 setName，否则 setName 会写进主包而放不下。
+    adv->enableScanResponse(true);
+    adv->setName(name);
 
     // 不调用 startAdvertising()，等配网时手动触发
-    LOG("[BLE] 蓝牙已初始化(未广播)，设备名: %s\n", name);
+    LOG("[BLE] 蓝牙已初始化(未广播)，设备名(扫描响应): %s\n", name);
 }
 
 // ----------------------------------------------------------
@@ -338,12 +342,18 @@ void ConfigManager::handleBLEWrite(const String& payload) {
         bool hasCreds = incoming.containsKey("ssid") && incoming.containsKey("password");
         bool changed  = false;
 
+        // ★ matchCode/dndPeriods 是字符串：.as<String>() 会 malloc，必须在临界区【外】先取好，
+        //   不能在临界区里构造临时 String。brightness/volume 是整型，pool 赋值不 malloc，可留在里面。
+        bool   hasMatch = incoming.containsKey("matchCode");
+        bool   hasDnd   = incoming.containsKey("dndPeriods");   // 紧凑串 "s-e,s-e"（半小时索引，s>e=跨0点）；空串=关闭
+        String matchV   = hasMatch ? incoming["matchCode"].as<String>()  : String();
+        String dndV     = hasDnd   ? incoming["dndPeriods"].as<String>() : String();
+
         taskENTER_CRITICAL(&_mux);
-        if (incoming.containsKey("brightness")) { _doc["brightness"] = incoming["brightness"];              changed = true; }
-        if (incoming.containsKey("volume"))     { _doc["volume"]     = incoming["volume"];                  changed = true; }
-        if (incoming.containsKey("matchCode"))  { _doc["matchCode"]  = incoming["matchCode"].as<String>();  changed = true; }
-        // 勿扰时段：紧凑字符串 "s-e,s-e"（半小时索引 s∈0..47 / e∈1..48，s>e=跨0点）；空串=关闭
-        if (incoming.containsKey("dndPeriods")) { _doc["dndPeriods"] = incoming["dndPeriods"].as<String>(); changed = true; }
+        if (incoming.containsKey("brightness")) { _doc["brightness"] = incoming["brightness"]; changed = true; }
+        if (incoming.containsKey("volume"))     { _doc["volume"]     = incoming["volume"];     changed = true; }
+        if (hasMatch)  { _doc["matchCode"]  = matchV; changed = true; }
+        if (hasDnd)    { _doc["dndPeriods"] = dndV;   changed = true; }
         if (hasCreds) {
             const char* s = incoming["ssid"]     | "";
             const char* p = incoming["password"] | "";
@@ -371,19 +381,24 @@ void ConfigManager::handleBLEWrite(const String& payload) {
         return;
     }
 
-    // ═══ 正常模式：原逻辑不变（也是增量更新）═══
+    // ═══ 正常模式：增量更新 ═══
+    // ★ key 必须用 String 复制：直接用 incoming 里的 const char* 作 key，ArduinoJson 只存指针，
+    //   incoming 出栈后 key 悬空（同 setString 注释里的坑）。String 在临界区【外】构造，
+    //   既复制了 key、又不在临界区里 malloc。
     if (incoming.containsKey("key") && incoming.containsKey("value")) {
-        const char* key = incoming["key"];
+        String       key = incoming["key"].as<String>();
         JsonVariant  val = incoming["value"];
         taskENTER_CRITICAL(&_mux);
-        _doc[key] = val;
+        _doc[key] = val;               // String key → 复制进 pool；value 亦复制
         taskEXIT_CRITICAL(&_mux);
     } else {
-        taskENTER_CRITICAL(&_mux);
         for (JsonPair kv : incoming.as<JsonObject>()) {
-            _doc[kv.key()] = kv.value();
+            String      skey = kv.key().c_str();   // 复制 key（临界区外）
+            JsonVariant sval = kv.value();
+            taskENTER_CRITICAL(&_mux);
+            _doc[skey] = sval;
+            taskEXIT_CRITICAL(&_mux);
         }
-        taskEXIT_CRITICAL(&_mux);
     }
 
     if (save()) {
@@ -469,11 +484,13 @@ void ConfigManager::loop() {
 
 void ConfigManager::printConfig() const {
     LOG("[CFG] ===== 当前配置 =====\n");
+    // ★ 用固定栈缓冲序列化：临界区内禁 malloc（原来的 String output 会在临界区里 realloc）。
+    //   与 toJsonString() 保持一致的安全写法。
+    char buf[CONFIG_DOC_SIZE * 2];
     taskENTER_CRITICAL(const_cast<portMUX_TYPE*>(&_mux));
-    String output;
-    serializeJsonPretty(_doc, output);
+    serializeJsonPretty(_doc, buf, sizeof(buf));
     taskEXIT_CRITICAL(const_cast<portMUX_TYPE*>(&_mux));
-    LOG("%s\n", output.c_str());
+    LOG("%s\n", buf);
     LOG("[CFG] ====================\n");
 }
 

@@ -93,6 +93,13 @@ typedef struct {
 
 void lcdInit();
 void lcdTask(void *lcdParameter);
+
+// 停止开机转圈并等其退出（创建 lcdTask 前调用，交接 tft 所有权）。见 lcd.cpp 启动转圈段。
+void lcdStopBootSpinner();
+
+// 全屏显示"没电"图标 holdMs 毫秒（亮度 50）。关机休眠态长按开机、复检仍没电时用。
+// 纯净环境可调用（内部自行 tft.init，不预加载视频）；显示完关背光，调用方随后 esp_restart。
+void lcdShowLowBatteryScreen(uint32_t holdMs);
 const lcdStats_t* lcdGetStats();
 
 /** web 任务下载完新视频后调用，通知 LCD 重新加载 target 视频 */

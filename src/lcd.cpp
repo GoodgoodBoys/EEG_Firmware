@@ -239,6 +239,7 @@ static bool finalizeSlotFromData(int slotIdx, uint8_t* data, size_t totalRead,
     slot.frameCount = frameCount;
     slot.loaded     = true;
     strncpy(slot.path, path, sizeof(slot.path) - 1);
+    slot.path[sizeof(slot.path) - 1] = '\0';   // strncpy 不保证补零，显式终止
 
     LOG("[LCD] 缓存[%d] ✓ %s → PSRAM\n", slotIdx, path);
     LOG("[LCD]   大小: %dKB | 帧数: %d | 加载: %dms\n",
@@ -510,6 +511,7 @@ static bool switchToVideo(const char* path)
 
         const char* name = strrchr(path, '/');
         strncpy(stats.currentFile, name ? name + 1 : path, sizeof(stats.currentFile) - 1);
+        stats.currentFile[sizeof(stats.currentFile) - 1] = '\0';
         stats.fileSize = cache[slot].dataSize;
 
         LOG("[LCD] ▶ 播放(PSRAM): %s [%d帧]\n", stats.currentFile, cache[slot].frameCount);
@@ -535,6 +537,7 @@ static bool switchToVideo(const char* path)
 
     const char* name = strrchr(path, '/');
     strncpy(stats.currentFile, name ? name + 1 : path, sizeof(stats.currentFile) - 1);
+    stats.currentFile[sizeof(stats.currentFile) - 1] = '\0';
 
     LOG("[LCD] ▶ 播放(SD流式): %s [%dKB]\n",
         stats.currentFile, (int)(stats.fileSize / 1024));
@@ -553,6 +556,15 @@ static void switchToLoop(const char* path)
 }
 
 static void switchToFree() { switchToLoop(LCD_FREE_VIDEO); }   // idle 循环
+
+// 是否存有自定义视频(target)：优先看缓存（常态已预加载，纯内存查询），缓存未命中再查文件
+// （PSRAM 不足改流式播放的兜底）。两者皆无 = 未存自定义视频（App 从未上传过）。
+static bool hasTargetVideo()
+{
+    int slot = findCacheSlot(LCD_MOTION_VIDEOSHOW_PATH);
+    if (slot >= 0 && cache[slot].frameCount > 0) return true;
+    return LittleFS.exists(LCD_MOTION_VIDEOSHOW_PATH);
+}
 
 static const char* motionToPath(MOTION_t motion)
 {
@@ -577,7 +589,15 @@ static void processMessage(MessageToLCD_t& rxMsg, bool& msgPending, int& playCou
         return;
     }
 
-    const char* path = motionToPath(rxMsg.motion);
+    MOTION_t motion = rxMsg.motion;
+    // ★ 收到"播自定义视频(target)"请求（好友发视频 VIDEO_SHOW）、但设备没存自定义视频时 →
+    //   退回播点头(nod)，而不是待机 idle。（伙伴拍一拍 POKE 现固定走 MOTION_TAP，不经此分支）
+    if (motion == MOTION_VIDEOSHOW && !hasTargetVideo()) {
+        LOG("[LCD] 无自定义视频 → 拍一拍改播点头(nod)\n");
+        motion = MOTION_TAP;
+    }
+
+    const char* path = motionToPath(motion);
     strcpy(playerInfo->videoPath, path);
     playerInfo->playTimes    = rxMsg.playTimes;
     playerInfo->interruptAble = rxMsg.interruptAble;
@@ -644,72 +664,145 @@ static void reloadTargetVideo()
 
 #define LCD_TARGET_SLOT   7
 
-static volatile int  g_tgtReq  = 0;    // 0=无, >0=commit(字节数), -1=abort
+#define TGT_REQ_NONE    0
+#define TGT_REQ_ABORT  (-1)
+#define TGT_REQ_BEGIN  (-2)
+
+static volatile int  g_tgtReq  = TGT_REQ_NONE;  // 0=无, >0=commit(字节数), -1=abort, -2=begin
 static volatile bool g_tgtDone = false;
 static volatile bool g_tgtOk   = false;
 
-uint8_t* lcdTargetRecvBegin(size_t* maxBytes)
+// begin 的结果（lcdTask 填写，webTask 在 g_tgtDone 置位后读取）。
+// volatile 限定的是【指针变量本身】(uint8_t* volatile)，不是它指向的数据。
+static uint8_t* volatile g_tgtBase  = nullptr;
+static volatile size_t   g_tgtAvail = 0;
+
+// 请求被 webTask 放弃（等超时且宽限期内也没完成）。lcdTask 完成时据此不再置 g_tgtDone，
+// 避免迟到的置位串扰到下一次请求。每次新请求发起时清零。
+static volatile bool s_tgtAbandoned = false;
+
+// ★ 忙等 lcdTask 处理有 5s 超时兜底：这三个接口都跑在 mqttCallback→webTask 上下文。
+//   若 lcdTask 因任何原因未及时响应（渲染卡顿/解码损坏帧/被挂起），死等会把整个
+//   MQTT 收包线程钉住。超时改为返回失败，上层走 rollback + 回 VIDEO_FAIL，最坏退化成
+//   "本次传输失败可重试"。（等待期间由 waitTgtDone 负责喂 TWDT，见下。）
+//   实测各阻塞点均远小于此：L2 休眠 500ms / 信封弹跳 ≤1.3s / 配网 60ms / 传输期 166ms。
+#define LCD_RECV_WAIT_TIMEOUT_MS  5000
+
+// 等 lcdTask 处理完一次请求；返回 false = 超时（调用方按失败处理）
+// ★ 循环内必须喂狗：本函数跑在 webTask，而 webTask 稳态是订阅了 TWDT(8s) 的。
+//   begin/commit 各自最长等 5s，若同一次 client.loop() 里连着处理两条控制帧（NEW_VIDEO
+//   与 END_VIDEO 都可能在一次 available() 突发里到达），累计就会越过 8s 触发 panic。
+//   esp_task_wdt_reset() 对未订阅的任务是空操作，其它路径（waitPersistIdle）也是这么用的。
+static bool waitTgtDone(const char* what)
 {
-    if (currentSlot == LCD_TARGET_SLOT) switchToFree();   // 传输期本就待机，保险
-    poolFreeFrom(LCD_TARGET_SLOT);                        // 释放旧 target，腾出空闲尾部
-
-    size_t reserve = (size_t)MAX_FRAMES_PER_VIDEO * sizeof(frameEntry_t) + 4096;
-    if (poolUsed + reserve >= PSRAM_LCD_POOL_SIZE) { if (maxBytes) *maxBytes = 0; return nullptr; }
-
-    size_t avail = PSRAM_LCD_POOL_SIZE - poolUsed - reserve;
-    if (maxBytes) *maxBytes = avail;
-    LOG("[LCD] target 直收准备：基址 %p 上限 %dKB\n", psramPool + poolUsed, (int)(avail / 1024));
-    return psramPool + poolUsed;     // 接收基址（commit 时再 poolAlloc 正式占用）
+    uint32_t t0 = millis();
+    while (!g_tgtDone) {
+        if (millis() - t0 > LCD_RECV_WAIT_TIMEOUT_MS) {
+            // ★ 撤请求只对【还没被取走】的请求有效。lcdTask 取 req 时是先读后清零
+            //   （req = g_tgtReq; g_tgtReq = NONE;），所以这里写 NONE 可能已经晚了——
+            //   它或许正在执行池操作。故超时后再宽限一小段，看它是否马上完成；
+            //   真完成了就按成功返回，避免"webTask 判失败回滚、lcdTask 却已提交"的状态撕裂。
+            g_tgtReq = TGT_REQ_NONE;
+            for (int i = 0; i < 20 && !g_tgtDone; i++) {   // 再等 100ms
+                vTaskDelay(pdMS_TO_TICKS(5));
+                esp_task_wdt_reset();
+            }
+            if (g_tgtDone) {
+                LOG("[LCD] ⚠ %s 超时后宽限期内完成，按成功处理\n", what);
+                return true;
+            }
+            // ★ 宽限期也没完成 → 只能判失败，但 lcdTask 可能【此后】才完成并置 g_tgtDone。
+            //   那个迟到的置位会被下一次请求的等待循环误当成"本次已完成"而立即返回
+            //   （下一次请求开头虽然清了 g_tgtDone，但清零与 lcdTask 的迟到写入存在竞争）。
+            //   置弃用标记：lcdTask 完成时若发现请求已被放弃，就不再置 g_tgtDone。
+            s_tgtAbandoned = true;
+            LOG("[LCD] ✗ %s 等 lcdTask 超时(%dms)\n", what, LCD_RECV_WAIT_TIMEOUT_MS);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+        esp_task_wdt_reset();             // 未订阅则空操作
+    }
+    return true;
 }
 
-// ★ 忙等 lcdTask 处理有 5s 超时兜底：本函数运行在 mqttCallback→webTask 上下文，
-//   期间 webTask 不喂 TWDT（8s）。若 lcdTask 因任何原因未及时响应（渲染卡顿/解码
-//   损坏帧/被挂起），死等会撑爆看门狗 panic 重启。超时改为返回失败，上层走 rollback +
-//   回 VIDEO_FAIL，最坏退化成"本次传输失败可重试"，绝不再拖到重启。
-#define LCD_RECV_WAIT_TIMEOUT_MS  5000
+// ★ 本函数运行在 webTask(mqttCallback) 上下文，但【切走播放 + 释放池】必须由 lcdTask 做：
+//   这两件事会把 cache[TARGET].frameIndex/data 置 nullptr，而 lcdTask 的 player() 里
+//   `frameEntry_t& fe = slot.frameIndex[currentFrame];` 紧跟在 frameCount 检查之后——
+//   跨任务清空正好插在这两行之间时就是空指针解引用（LoadProhibited 崩溃）。
+//   触发路径真实存在：无音轨的视频不发 NEW_AUDIO，NEW_VIDEO 的 enterTransferMode() 与本函数
+//   背靠背执行，而停播用的 XFER_LOCK 是绕队列到主循环再到 LCD 的异步消息，来不及生效。
+//   故改成与 commit/abort 相同的请求-应答握手，池操作全部收敛到属主任务 lcdTask。
+uint8_t* lcdTargetRecvBegin(size_t* maxBytes)
+{
+    g_tgtDone      = false;
+    s_tgtAbandoned = false;   // 新请求，清掉上一次可能留下的放弃标记
+    g_tgtBase  = nullptr;
+    g_tgtAvail = 0;
+    g_tgtReq   = TGT_REQ_BEGIN;
+    if (!waitTgtDone("begin")) { if (maxBytes) *maxBytes = 0; return nullptr; }
+    if (maxBytes) *maxBytes = g_tgtAvail;
+    return g_tgtBase;
+}
 
 bool lcdTargetRecvCommit(size_t size)
 {
     g_tgtDone = false; g_tgtOk = false;
+    s_tgtAbandoned = false;
     g_tgtReq  = (int)size;
-    uint32_t t0 = millis();
-    while (!g_tgtDone) {
-        if (millis() - t0 > LCD_RECV_WAIT_TIMEOUT_MS) {
-            LOG("[LCD] ✗ commit 等 lcdTask 超时(%dms)，判失败\n", LCD_RECV_WAIT_TIMEOUT_MS);
-            g_tgtReq = 0;                 // 撤请求（lcdTask 下轮读到 0 直接跳过）
-            return false;
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
+    if (!waitTgtDone("commit")) return false;
     return g_tgtOk;
 }
 
 void lcdTargetRecvAbort()
 {
     g_tgtDone = false;
-    g_tgtReq  = -1;
-    uint32_t t0 = millis();
-    while (!g_tgtDone) {
-        if (millis() - t0 > LCD_RECV_WAIT_TIMEOUT_MS) {
-            LOG("[LCD] ✗ abort 等 lcdTask 超时(%dms)，放弃等待\n", LCD_RECV_WAIT_TIMEOUT_MS);
-            g_tgtReq = 0;
-            return;
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
+    s_tgtAbandoned = false;
+    g_tgtReq  = TGT_REQ_ABORT;
+    waitTgtDone("abort");
 }
 
 // 在 lcdTask 循环里调用：真正执行 commit/abort（池操作的属主在此）
 static void lcdProcessTargetRecv()
 {
     int req = g_tgtReq;
-    if (req == 0) return;
-    g_tgtReq = 0;
+    if (req == TGT_REQ_NONE) return;
+    g_tgtReq = TGT_REQ_NONE;
+
+    if (req == TGT_REQ_BEGIN) {
+        // 直收准备：切走 target 播放 + 释放旧 target，腾出池的空闲尾部当接收缓冲。
+        // 在 lcdTask 里做 → 与 player() 天然互斥，不会在它解引用 frameIndex 时被抽走。
+        if (currentSlot == LCD_TARGET_SLOT) switchToFree();
+        poolFreeFrom(LCD_TARGET_SLOT);
+
+        size_t reserve = (size_t)MAX_FRAMES_PER_VIDEO * sizeof(frameEntry_t) + 4096;
+        if (poolUsed + reserve >= PSRAM_LCD_POOL_SIZE) {
+            g_tgtBase = nullptr; g_tgtAvail = 0;
+            LOG("[LCD] ✗ target 直收准备失败：池无空间\n");
+        } else {
+            g_tgtAvail = PSRAM_LCD_POOL_SIZE - poolUsed - reserve;
+            g_tgtBase  = psramPool + poolUsed;   // commit 时 poolAlloc 会返回同一地址
+            LOG("[LCD] target 直收准备：基址 %p 上限 %dKB\n",
+                g_tgtBase, (int)(g_tgtAvail / 1024));
+        }
+        stats.poolUsed = poolUsed;
+        // ★ 请求已被 webTask 放弃（等超时）→ 不置 g_tgtDone，避免这个迟到的置位
+        //   串扰到下一次请求。池操作本身已经做完且状态自洽（旧 target 已释放）。
+        if (!s_tgtAbandoned) g_tgtDone = true;
+        return;
+    }
 
     if (req > 0) {
-        uint8_t* data = poolAlloc((size_t)req);    // 返回值 == 接收基址
-        bool ok = data && finalizeSlotFromData(LCD_TARGET_SLOT, data, (size_t)req,
-                                               LCD_MOTION_VIDEOSHOW_PATH, 0);
+        uint8_t* data = poolAlloc((size_t)req);    // 应当 == begin 返回的接收基址
+        // ★ 不变量校验：webTask 是照 begin 给的基址把分片写进池的，commit 这次 poolAlloc
+        //   必须落在同一地址。若两者之间有别的 poolAlloc 插进来（如 LCD_ERROR 恢复时
+        //   重载 idle），地址会错位，那样建出的帧索引指向的根本不是收到的数据 → 花屏/崩溃。
+        //   宁可判失败回滚、让 App 重传，也不要把错位数据当成有效视频。
+        bool addrOk = (data == g_tgtBase);
+        if (data && !addrOk)
+            LOG("[LCD] ✗ commit 基址错位 %p != %p（期间池被别处分配过）\n", data, g_tgtBase);
+        bool ok = data && addrOk &&
+                  finalizeSlotFromData(LCD_TARGET_SLOT, data, (size_t)req,
+                                       LCD_MOTION_VIDEOSHOW_PATH, 0);
         if (!ok) {                                  // 建索引失败 → 回退到 flash 旧文件
             poolFreeFrom(LCD_TARGET_SLOT);
             loadVideoToCache(LCD_TARGET_SLOT, LCD_MOTION_VIDEOSHOW_PATH);
@@ -728,7 +821,7 @@ static void lcdProcessTargetRecv()
         if (cache[i].loaded) { stats.cachedVideos++; stats.totalCachedFrames += cache[i].frameCount; }
     }
     stats.poolUsed = poolUsed;
-    g_tgtDone = true;
+    if (!s_tgtAbandoned) g_tgtDone = true;   // 理由同上：被放弃的请求不再置完成标志
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -811,6 +904,54 @@ static void drawBatteryOn(lgfx::LovyanGFX& g)
 }
 
 // ══════════════════════════════════════════════════════════════
+//  没电大图标（居中）：横向电池轮廓 + 内部 ~10% 红色残量 + 红色感叹号。
+//  低电关机后长按开机、复检仍 ≤6.4V 时全屏显示 3 秒。风格延续 drawBatteryOn。
+// ══════════════════════════════════════════════════════════════
+static void drawLowBatteryIcon(lgfx::LovyanGFX& g)
+{
+    const int cx = g.width() / 2, cy = g.height() / 2;
+    const int W = 120, H = 60, NUB = 7, NUBH = 20, TH = 5, R = 12;  // 电池体宽高、正极头宽高、描边粗、圆角半径
+    const int x = cx - (W + NUB) / 2;
+    const int y = cy - H / 2;
+
+    g.fillScreen(TFT_BLACK);
+
+    // 圆角外壳：白圆角实心 → 内部挖黑，留 TH 宽干净白边框。
+    //   （多层 drawRoundRect 各层半径 R-i 不同、圆角弧不连续，四角会露黑点；
+    //     "填充-挖空"两步的圆角是连续的，边框干净无锯齿。）
+    g.fillRoundRect(x, y, W, H, R, TFT_WHITE);
+    g.fillRoundRect(x + TH, y + TH, W - 2 * TH, H - 2 * TH, R - TH, TFT_BLACK);
+
+    // 正极头：贴电池体右侧直边、竖向居中，内插 2px 与体咬合（不留缝、不凸太多）
+    g.fillRoundRect(x + W - 2, cy - NUBH / 2, NUB + 2, NUBH, 3, TFT_WHITE);
+
+    // 内部 ~10% 红色残量条（靠左）
+    const int inX = x + TH + 5, inY = y + TH + 5;
+    const int inH = H - 2 * (TH + 5);
+    const int fillW = (W - 2 * (TH + 5)) * 10 / 100;
+    g.fillRect(inX, inY, fillW, inH, TFT_RED);
+
+    // 红色感叹号（在电池体水平 + 竖直正中心）：粗竖条 + 下圆点
+    const int exX = x + W / 2;                       // 电池体水平中心
+    const int barW = 10, barTop = y + 12, barH = 22; // 竖条：整体竖向居中于 H=60
+    g.fillRect(exX - barW / 2, barTop, barW, barH, TFT_RED);
+    g.fillCircle(exX, barTop + barH + 9, 5, TFT_RED); // 竖条下方间隙 4 + 圆点半径 5
+}
+
+// 全屏显示没电图标 holdMs 毫秒（亮度 50），用于关机休眠态复检仍没电时的提示。
+// 纯净环境可调用：内部自行 tft.init（不预加载视频）；显示完关背光，调用方随后 esp_restart。
+void lcdShowLowBatteryScreen(uint32_t holdMs)
+{
+    tft.init();
+    tft.setRotation(LCD_ROTATION);
+    tft.setBrightness(0);            // 先灭再画，避免点亮瞬间花屏
+    drawLowBatteryIcon(tft);
+    tft.setBrightness(50);           // 需求指定亮度 50
+    delay(holdMs);
+    tft.setBrightness(0);            // 关背光（随后 esp_restart 复位面板）
+}
+
+// ══════════════════════════════════════════════════════════════
 //  配对爱心叠加：两颗粉色爱心（一大一小重叠）——已互绑且伙伴在线时显示
 // ══════════════════════════════════════════════════════════════
 extern volatile bool g_pairLinked;     // web.cpp：已互绑 且 伙伴在线
@@ -848,7 +989,10 @@ static void drawPairHeartsOn(lgfx::LovyanGFX& g)
 // ── WiFi 状态图标：连上=白色，未连=红色 + 右下角叉。三段弧 + 底部圆点。──
 extern volatile bool g_wifiOnline;     // web.cpp：WiFi 是否已连接
 extern volatile bool g_xfering;        // web.cpp：视频/音频下载传输中
-extern volatile int  g_persistPending; // web.cpp：在途落盘作业数（>0 = 存盘中）
+extern volatile bool g_persistWriting; // web.cpp：persistTask 是否【真正在写 flash】。
+                                       // ★ 不用 g_persistPending：落盘已改为延后到 L2 窗口，
+                                       //   作业会排队好几分钟、pending 全程 >0 却没在写，
+                                       //   用它判会让 LCD 从传输完成起一直卡在低帧率。
 extern volatile int      g_provStage;    // provision.cpp：配网阶段 1=等BLE 2=BLE已连 3=连WiFi中
 extern volatile uint32_t g_provDeadline; // provision.cpp：等BLE倒计时截止 millis
 extern volatile bool     g_needWifiHint; // web.cpp：有配置但连不上 → 显示"长按2秒配置"引导
@@ -937,6 +1081,9 @@ static void handleErrorState()
 //  初始化
 // ══════════════════════════════════════════════════════════════
 
+// 前置声明：lcdInit 里 tft.init() 之后立即后台起转（定义在 drawXferAnim 之后）。
+static void lcdStartBootSpinner();
+
 void lcdInit()
 {
     LOG("[LCD] ═══════════════════════════════════\n");
@@ -948,10 +1095,18 @@ void lcdInit()
     tft.setRotation(LCD_ROTATION);
     {
         int initBri = Config.getInt("brightness", 255);
-        tft.setBrightness((uint8_t)initBri);
-        s_curBri = s_tgtBri = initBri;   // 渐变状态初值：与开机亮度对齐
+        // ★ init 后先灭：面板刚复位、8 个视频尚未预加载完，此时点亮只会显示花屏。
+        //   背光保持 0，由 lcdTask 开机进度条每帧渐亮到目标（转圈"从黑淡入"，消除开机花屏闪）。
+        tft.setBrightness(0);
+        s_curBri = 0;                    // 从全灭开始
+        s_tgtBri = initBri;              // 目标 = 配置亮度，开机转圈期间渐亮到此
         s_panelSlept = false;
     }
+
+    // ★ 面板已就绪 → 立刻后台起"开机转圈"，覆盖下面预加载 + 各外设初始化的黑屏。
+    //   本任务在 core0 独立渲染，setup 主线程(core1)继续预加载/初始化，两者并行不冲突
+    //   （预加载/音频/IMU/舵机均不碰 tft）。创建 lcdTask 前由 lcdStopBootSpinner() 交接。
+    lcdStartBootSpinner();
 
     // ── 全屏帧缓冲（PSRAM）：用于"视频帧 + 电量叠加"合成后整块推屏，消除叠加闪烁 ──
     frameCanvas.setColorDepth(16);
@@ -986,7 +1141,6 @@ void lcdInit()
         (int)(PSRAM_LCD_POOL_SIZE / 1024), psramPool);
 
     // ── 分配 playerInfo ──
-    playerInfo = (playerInfo_t*)poolAlloc(sizeof(playerInfo_t));
     playerInfo = (playerInfo_t*)poolAlloc(sizeof(playerInfo_t));
     if (playerInfo == NULL) {
         LOG("[LCD] ✗ playerInfo 分配失败！PSRAM池已满\n");
@@ -1216,6 +1370,13 @@ static void drawProvAnim()
     g.setTextSize(1);
     g.setTextDatum(textdatum_t::middle_center);
     g.drawString(buf, cx, cy + 70);
+
+    // ── 设备 SN（白，配网全程显示，供用户与 App 弹窗核对是否为本机）──
+    //   SN 在开机时已镜像进 Config（V1_1.cpp），配网期间恒定可读。
+    char snbuf[32];
+    snprintf(snbuf, sizeof(snbuf), "SN：%s", Config.getString("SN", "").c_str());
+    g.drawString(snbuf, cx, cy + 94);
+
     g.setTextDatum(textdatum_t::top_left);               // 复位，避免影响别处绘制
     g.setFont(&fonts::Font0);
 
@@ -1422,14 +1583,15 @@ static void drawXferAnim()
         }
     }
 
-    if (g_xferAnim == 1) {                    // 转圈：整圈 48 段短弧，头亮尾黑渐变（连续，不点状）
+    if (g_xferAnim == 1) {                    // 转圈：整圈 48 段短弧，头亮尾黑渐变（顺时针，连续不点状）
         float seg = 360.0f / SPIN_SEGS;
         for (int i = 0; i < SPIN_SEGS; i++) {
-            float a0 = fmodf(s_spinAng + i * seg, 360.0f), a1 = a0 + seg + 0.6f;
+            // 尾巴沿逆时针方向渐暗（拖在顺时针前进的后方）：a0 = 头部 - i*seg
+            float a0 = fmodf(s_spinAng - i * seg + 360.0f, 360.0f), a1 = a0 + seg + 0.6f;
             int lv = 255 - 255 * i / SPIN_SEGS;
             tft.fillArc(cx, cy, SPIN_R0, SPIN_R1, a0, a1, tft.color565(lv, lv, lv));
         }
-        s_spinAng -= SPIN_STEP; if (s_spinAng < 0) s_spinAng += 360;
+        s_spinAng += SPIN_STEP; if (s_spinAng >= 360) s_spinAng -= 360;   // 头部顺时针推进
     } else if (g_xferAnim == 2 && checkSpr.width() > 0) {
         uint32_t el = millis() - s_checkT0;
         float p = el < CHECK_SWEEP_MS ? (float)el / CHECK_SWEEP_MS : 1.0f;
@@ -1466,25 +1628,57 @@ static void drawXferAnim()
     }
 }
 
+// ══════════════════════════════════════════════════════════════
+//  开机启动转圈（提前到 tft.init() 之后即起转，覆盖预加载 + 外设初始化黑屏）
+//    独立任务 pin 到 core0：启动期该核空闲、屏幕 SPI 无其它用户，与 setup 主线程
+//    (core1) 的预加载/音频/IMU/舵机初始化并行——它们都不碰 tft，无并发冲突。
+//    ★ 交接：创建 lcdTask 前必须 lcdStopBootSpinner()，阻塞等本任务退出后再让
+//      lcdTask 接管 tft，杜绝两任务同时写屏。
+// ══════════════════════════════════════════════════════════════
+static volatile bool s_bootSpinRun  = false;
+static TaskHandle_t  s_bootSpinTask = nullptr;
+
+static void bootSpinnerTask(void*)
+{
+    tft.fillScreen(0x0000);          // 先刷黑：点亮时不显示面板复位后的残留像素（消花屏）
+    g_xferAnim = 1;                  // 复用转圈动画（drawXferAnim 的转圈分支）
+    while (s_bootSpinRun) {
+        stepBrightness();            // 每帧朝 s_tgtBri 渐亮 —— 转圈"从黑淡入"
+        tft.startWrite();
+        drawXferAnim();
+        tft.endWrite();
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    g_xferAnim = 0; s_xferMode = 0;  // 交接前清转圈态，lcdTask 接管后直接进待机
+    s_bootSpinTask = nullptr;        // ★ 置空=已退出、不再碰 tft，lcdStopBootSpinner 据此放行
+    vTaskDelete(NULL);
+}
+
+static void lcdStartBootSpinner()
+{
+    if (s_bootSpinTask) return;
+    s_bootSpinRun = true;
+    // core0（启动期空闲）与 setup 主线程(core1)并行，转圈才持续流畅、不被阻塞初始化冻结
+    xTaskCreatePinnedToCore(bootSpinnerTask, "BootSpin", 3072, NULL, 1, &s_bootSpinTask, 0);
+}
+
+void lcdStopBootSpinner()
+{
+    s_bootSpinRun = false;
+    if (!s_bootSpinTask) return;
+    // 阻塞等任务真正退出（handle 置空）后再返回——确保它已不再碰 tft，lcdTask 才安全接管
+    uint32_t t0 = millis();
+    while (s_bootSpinTask && millis() - t0 < 1000) vTaskDelay(pdMS_TO_TICKS(5));
+}
+
 void lcdTask(void *lcdParameter)
 {
     LOG("[LCD] Task 启动\n");
     esp_task_wdt_add(NULL);   // 纳入 TWDT：本任务 5s 内不 reset 即 panic 点名（各阻塞点 <5s）
 
-    // ── 开机进度条：象征性转圈约 1s，之后把背光压到 0，让待机动画从暗渐亮出来（渐变出待机）──
-    {
-        g_xferAnim = 1;                          // 复用转圈动画
-        uint32_t t0 = millis();
-        while (millis() - t0 < 1000) {
-            esp_task_wdt_reset();
-            tft.startWrite();
-            drawXferAnim();
-            tft.endWrite();
-            vTaskDelay(pdMS_TO_TICKS(30));
-        }
-        g_xferAnim = 0; s_xferMode = 0;
-        s_curBri = 0;                            // 背光归 0 → 主循环 stepBrightness 随首帧待机渐亮
-    }
+    // ── 开机转圈已由 bootSpinnerTask 提前（tft.init 后即起转）覆盖整个启动黑屏，并把
+    //    背光从全灭渐亮到 s_tgtBri。此处不再重复转圈，直接进主循环接待机；此时
+    //    s_curBri 已 == s_tgtBri，主循环首帧 stepBrightness 不跳变，无暗闪。──
 
     MessageToLCD_t rxMsg;
     bool msgPending  = false;
@@ -1501,10 +1695,32 @@ void lcdTask(void *lcdParameter)
         frameStartTime = millis();
 
         // ── 接收消息 ──
-        if (xQueueReceive(qMainToLcd, &rxMsg, 0) == pdTRUE) {
-            switch (rxMsg.cmd) {
+        // ★ 先收进临时变量，确认要采纳了才写进 rxMsg：rxMsg 只有一个槽位，直接收进去
+        //   会把尚未处理的上一条无声顶掉（见下面 wink 的优先级判断）。
+        MessageToLCD_t inMsg;
+        if (xQueueReceive(qMainToLcd, &inMsg, 0) == pdTRUE) {
+            switch (inMsg.cmd) {
                 case LCDMSG_PLAY:
                 case LCDMSG_PLAY_NONINT:
+                    // ★ wink（拍一拍已送达）只是锦上添花的反馈，优先级低于点头动画本身。
+                    //   场景：正播好友视频(NONINT)时用户拍了一下 → 点头挂在 msgPending 里
+                    //   等视频播完；此时伙伴的 POKE_ACK 回来触发 wink，若直接收进 rxMsg
+                    //   就会把还没轮到播的点头顶掉，变成"只眨眼、不点头"。
+                    //   宁可这次不眨眼，也不能吞掉点头。
+                    if (inMsg.motion == MOTION_WINK && msgPending) {
+                        LOG("[LCD] 已有待播动画，丢弃 wink（点头优先）\n");
+                        break;
+                    }
+                    // ★ 摇一摇去重：正在播放摇摆动画期间，忽略后续摇摆——既不打断当前、也不排队重播。
+                    //   摇一摇会由 SERVO/IMU/P3 镜像连发多条触发；在池/播放状态的属主任务 lcdTask 里
+                    //   原子判定丢弃，兜住主循环侧 !lcdIsPlaying() 守卫因跨任务状态滞后而漏进来的那几条。
+                    if (inMsg.motion == MOTION_SHAKE &&
+                        (lcdState == LCD_PLAYING || lcdState == LCD_PLAYING_NONINT) &&
+                        strcmp(playerInfo->videoPath, LCD_MOTION_SHAKE_PATH) == 0) {
+                        LOG("[LCD] 摇摆播放中，忽略新的摇摆\n");
+                        break;
+                    }
+                    rxMsg      = inMsg;
                     msgPending = true;
                     break;
                 case LCDMSG_CFG_UPDATE: {
@@ -1583,6 +1799,15 @@ void lcdTask(void *lcdParameter)
             }
             s_xferMode = 0;   // 已退出传输动画：下次进入重新 init
 
+            // ── 下载期(App→设备)：冻结当前帧，接收方【无感】──
+            //   不解码 MJPEG、不改屏：屏幕停在原样，看不出在下载；把 core0 全让给 webTask 收包，
+            //   修"边播视频边下载→视频极慢+下载失败"。lcdProcessTargetRecv() 在循环顶部照常跑，
+            //   视频收齐照常提交；下载结束(g_xfering=0)自动恢复状态机继续播放/待机。
+            if (g_xfering) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
+
             tft.startWrite();
             // ── 状态机 ──
             switch (lcdState) {
@@ -1657,7 +1882,7 @@ void lcdTask(void *lcdParameter)
             //   正常：固定帧率——补偿解码用时，凑够 FRAME_MS 维持流畅（慢帧只让 1 tick）。
             //   下载/存盘：固定延迟——不看解码用了多久，每帧后无条件让出 LCD_XFER_DELAY_MS，
             //   保证 core0 稳定分给 webTask 收包 / persistTask 落盘，不被 LCD 慢帧连续解码饿死。
-            if (g_xfering || g_persistPending > 0) {
+            if (g_xfering || g_persistWriting) {
                 vTaskDelay(pdMS_TO_TICKS(LCD_XFER_DELAY_MS));   // 固定延迟，与解码用时无关
             } else {
                 uint32_t frameUsedTime = millis() - frameStartTime;

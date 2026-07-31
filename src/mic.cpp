@@ -12,10 +12,19 @@
 // 16kHz 单声道语音，64kbps 音质更干净；30s ≈ 240KB（10 条 2.4MB 够存）
 #define MP3_BITRATE_KBPS   64
 
+// 最短有效录音时长（ms）：短于此（或编码为空）视为误触/碎录音 → 丢弃，不占槽、不推送。
+// 从源头挡住"快速连按侧键"产生的碎语音刷屏（推送轰炸 + 伙伴蛋碎播 + 占槽）。
+#define MIN_RECORD_MS      1000
+
+// 录音临时文件：先录到这里，录完【有效】才提交(rename)到正式语音槽 voice_N。
+// 好处：无效录音不占槽/不淘汰；满槽时也只有"确认要保存"才去环形淘汰最旧一条。
+#define VOICE_TMP_PATH     "/voice_rec.tmp"
+
 // 麦克风软件数字增益：S3 的 PDM 驱动没有硬件 amplify_num，靠软件乘倍数提升
 // 录音电平（加在录音上，发给 App 的 MP3 也是正常音量）。带限幅防溢出。
-// 太小=录音轻，太大=大声说话会过压变浑浊（有软限幅兜底不硬破，但过高会闷/杂），实测调（8~20）。
-#define MIC_GAIN           14
+// 太小=录音轻，太大=大声说话会过压变浑浊（有软限幅兜底不硬破，但过高会闷/杂），实测调（8~24）。
+// 换新麦克风(SNR 更好、底噪低)后增益空间更大，提到 22 让录音电平达到正常音频水平。
+#define MIC_GAIN           20
 
 // ── 语音带通软件滤波 + 噪声门（S3 PDM 无硬件高通，靠软件去底噪）──
 //   MIC_HP_R：一阶高通，去直流/低频隆隆声，~120Hz。越接近 1 截止越低（去得越少）。
@@ -36,7 +45,7 @@
 #define MIC_GATE_FLOOR     0.25f     // 门关时降到 25%（不全静音，避免削小声语音）
 #define MIC_ENV_A          0.02f
 #define MIC_GATE_SMOOTH    0.03f
-#define MIC_LIMIT_KNEE     0.70f     // 软限幅拐点：低于此透明，高于此平滑压峰不硬削波
+#define MIC_LIMIT_KNEE     0.80f     // 软限幅拐点：低于此透明，高于此平滑压峰不硬削波（增益提高后抬高拐点，正常说话不被压闷）
 
 struct MicFilt { float hpX1, hpY1, lpS, env, gate; };
 
@@ -51,8 +60,19 @@ static inline float micSoftLimit(float v) {
     return v < 0 ? -comp : comp;
 }
 
+// ★调试开关：1=录音原始直通（不做高通/低通/噪声门/软限幅，只保留增益 + 硬限幅防 int16 回绕），
+//            0=正常滤波链。用于对比"滤波 vs 不滤波"的录音音质。测完想恢复就改回 0。
+#define MIC_RAW_PASSTHROUGH  0
+
 // 单个采样：高通 → 低通 → 增益 → 噪声门 → 软限幅。状态由调用方持有（每次录音重置）。
 static inline int16_t micProcess(int16_t raw, MicFilt* s) {
+#if MIC_RAW_PASSTHROUGH
+    (void)s;                                          // 直通不用滤波状态
+    float v = (float)raw * MIC_GAIN;                  // 只加增益（增益非滤波）；想更"裸"可把 MIC_GAIN 调到 1
+    if (v >  32767.0f) v =  32767.0f;                 // 硬限幅仅防 int16 回绕（不是压缩，也不是滤波）
+    if (v < -32768.0f) v = -32768.0f;
+    return (int16_t)v;
+#else
     float xf = (float)raw;
     float hp = xf - s->hpX1 + MIC_HP_R * s->hpY1;   // 一阶高通
     s->hpX1 = xf;
@@ -69,11 +89,17 @@ static inline int16_t micProcess(int16_t raw, MicFilt* s) {
     }
 
     return (int16_t)micSoftLimit(v);                 // 软限幅（响而不破）
+#endif
 }
 
 extern QueueHandle_t qMainToMic; // message queue |  main -> microphone
 extern QueueHandle_t qMicToMain; // message queue |  microphone -> main
 extern QueueHandle_t qMainToWeb; // 录完发 NEW_VOICE 给 webTask（触发推送）
+
+// web.cpp：App 当前正在发送的语音槽（-1=空闲）。环形淘汰最旧时跳过它，避免删到正被读的文件。
+extern volatile int g_voiceSendingId;
+// web.cpp：复用槽（环形淘汰）前清掉该槽旧 uid，保证 App 端不把新语音当旧的重发去重。
+extern void voiceSlotResetUid(int slot);
 
 // 录音音量表（lcd.cpp 定义并绘制）：录音时置位并写实时电平，LCD 据此画音量动画
 extern volatile bool g_micMeterActive;
@@ -93,6 +119,26 @@ static int findFreeVoiceSlot() {
         if (!LittleFS.exists(path)) return i;
     }
     return -1;
+}
+
+// 满槽时挑"最旧"的一条淘汰（环形队列：丢队头、腾位给新录音，保留最近 VOICE_MAX 条）。
+// 判据：getLastWrite() 最小者最旧；时间未同步/相等时天然退化为最小编号（先扫到先选中）。
+// ★ 跳过当前正被 App 发送的槽（g_voiceSendingId），避免删掉 webTask 正在读的文件。
+// 返回 -1 = 没有可淘汰的槽（极端：全部都在发送中，几乎不可能，因为一次只发一条）。
+static int pickOldestVoiceSlot() {
+    int    bestSlot = -1;
+    time_t bestTime = 0;
+    char   path[24];
+    for (int i = 0; i < VOICE_MAX; i++) {
+        if (i == g_voiceSendingId) continue;   // 别删正在发送的那条
+        snprintf(path, sizeof(path), VOICE_PATH_FMT, i);
+        File f = LittleFS.open(path, FILE_READ);
+        if (!f) continue;
+        time_t t = f.getLastWrite();
+        f.close();
+        if (bestSlot < 0 || t < bestTime) { bestSlot = i; bestTime = t; }
+    }
+    return bestSlot;
 }
 
 // 通知 webTask 发 NEW_VOICE 推送
@@ -150,18 +196,12 @@ bool initMIC() {
 }
 
 // 录制：Button1 单击开始，再单击（收到 MIC_STOP）或满 RECORD_MAX_MS 结束。
-// 边录边 Shine 编码写 MP3 到空的 voice 槽，录完发 NEW_VOICE。
+// 先边录边 Shine 编码写到【临时文件】；录完再判定：
+//   · 空 / 时长 < MIN_RECORD_MS → 丢弃（不占槽、不淘汰、不推送，挡碎语音刷屏）；
+//   · 有效 → 分配正式槽：有空位用空位，满 VOICE_MAX 条则环形淘汰最旧一条，
+//            把临时文件 rename 过去，再发 NEW_VOICE。
 void recordAndSave() {
-    // ── ⓪ 找空槽（最多 VOICE_MAX 条，存满则拒绝）──
-    int slot = findFreeVoiceSlot();
-    if (slot < 0) {
-        LOG("[MIC] ✗ 语音已存满 %d 条，等传给 App 清空后再录\n", VOICE_MAX);
-        return;
-    }
-    char voicePath[24];
-    snprintf(voicePath, sizeof(voicePath), VOICE_PATH_FMT, slot);
-
-    // ── ① 初始化 Shine 编码器（mono / SAMPLE_RATE / MP3_BITRATE_KBPS）──
+    // ── ① 初始化 Shine 编码器（mono / SAMPLE_RATE / MP3_BITRATE_KBPS）+ 打开临时文件 ──
     Mp3Enc* enc = mp3encOpen(SAMPLE_RATE, MP3_BITRATE_KBPS);
     if (!enc) {
         LOG("[MIC ERROR] MP3 编码器初始化失败（参数非法或内存不足）\n");
@@ -169,13 +209,13 @@ void recordAndSave() {
     }
     const int samplesPerPass = mp3encSamplesPerPass(enc);   // 每次编码需要的采样数
 
-    File f = LittleFS.open(voicePath, FILE_WRITE);
-    if (!f) { LOG("[MIC ERROR] 无法创建文件 %s\n", voicePath); mp3encClose(enc); return; }
+    File f = LittleFS.open(VOICE_TMP_PATH, FILE_WRITE);
+    if (!f) { LOG("[MIC ERROR] 无法创建临时文件 %s\n", VOICE_TMP_PATH); mp3encClose(enc); return; }
 
     // ── ② 启用麦克风（平时禁用省电，录音才开）──
     if (i2s_channel_enable(rx_handle) != ESP_OK) {
         LOG("[MIC ERROR] 启用麦克风失败\n");
-        f.close(); LittleFS.remove(voicePath); mp3encClose(enc); return;
+        f.close(); LittleFS.remove(VOICE_TMP_PATH); mp3encClose(enc); return;
     }
 
     static int16_t rdBuf[DMA_BUF_LEN];            // I2S 读缓冲
@@ -190,7 +230,7 @@ void recordAndSave() {
     g_micMeterActive = true;   // ★ 通知 LCD 切到录音音量表（全屏）
     g_micLevel = 0;
     LOG("[MIC] 开始录音 -> %s（MP3 %dkbps，最长 %us，再单击 Button1 停止）\n",
-        voicePath, MP3_BITRATE_KBPS, RECORD_MAX_MS / 1000);
+        VOICE_TMP_PATH, MP3_BITRATE_KBPS, RECORD_MAX_MS / 1000);
 
     bool stop = false;
     while (!stop) {
@@ -243,6 +283,8 @@ void recordAndSave() {
         }
     }
 
+    uint32_t recMs = millis() - startMs;   // 实际录音时长（最短时长判定用；编码收尾很快，忽略）
+
     // ── ③ 关闭麦克风省电（录音已结束，后面只是编码收尾）──
     i2s_channel_disable(rx_handle);
 
@@ -263,14 +305,43 @@ void recordAndSave() {
     s_recording = false;
     g_micMeterActive = false;   // ★ 录音结束：LCD 恢复 free 待机动画
 
-    if (mp3Bytes == 0) {
-        LOG("[MIC] ✗ 录音为空，删除 %s\n", voicePath);
-        LittleFS.remove(voicePath);
+    // ── ⑤ 有效性判定：空 或 太短(<门槛) → 丢弃临时文件，不占槽、不淘汰、不推送 ──
+    //   放在提交之前：无效录音绝不会误删已有的旧语音（避免"误触一下把一条旧消息挤掉却没录进东西"）。
+    if (mp3Bytes == 0 || recMs < MIN_RECORD_MS) {
+        LOG("[MIC] ✗ 录音无效（时长 %ums < %dms 或空 %uB），丢弃不推送\n",
+            (unsigned)recMs, MIN_RECORD_MS, (unsigned)mp3Bytes);
+        LittleFS.remove(VOICE_TMP_PATH);
         return;
     }
 
-    LOG("[MIC] ✓ 保存完成: %s  原始 %u 采样 -> MP3 %u 字节（槽 %d）\n",
-        voicePath, (unsigned)rawSamples, (unsigned)mp3Bytes, slot);
+    // ── ⑥ 分配正式槽：有空位用空位；满 VOICE_MAX 条则环形淘汰最旧一条（保留最近 N 条）──
+    int slot = findFreeVoiceSlot();
+    if (slot < 0) {
+        slot = pickOldestVoiceSlot();
+        if (slot < 0) {   // 极端：所有槽都在发送中（一次只发一条，几乎不可能）
+            LOG("[MIC] ✗ 所有语音槽都在发送中，暂丢弃本条\n");
+            LittleFS.remove(VOICE_TMP_PATH);
+            return;
+        }
+        char oldPath[24];
+        snprintf(oldPath, sizeof(oldPath), VOICE_PATH_FMT, slot);
+        LittleFS.remove(oldPath);
+        LOG("[MIC] 语音已满 %d 条，环形淘汰最旧槽 %d 腾位\n", VOICE_MAX, slot);
+    }
+    char voicePath[24];
+    snprintf(voicePath, sizeof(voicePath), VOICE_PATH_FMT, slot);
+
+    // ── ⑦ 提交：临时文件 rename 到正式槽 + 清该槽旧 uid（复用槽时防 App 按 uid 误去重）──
+    if (LittleFS.exists(voicePath)) LittleFS.remove(voicePath);
+    if (!LittleFS.rename(VOICE_TMP_PATH, voicePath)) {
+        LOG("[MIC ERROR] 提交失败（rename %s -> %s）\n", VOICE_TMP_PATH, voicePath);
+        LittleFS.remove(VOICE_TMP_PATH);
+        return;
+    }
+    voiceSlotResetUid(slot);
+
+    LOG("[MIC] ✓ 保存完成: %s  原始 %u 采样 -> MP3 %u 字节 时长 %ums（槽 %d）\n",
+        voicePath, (unsigned)rawSamples, (unsigned)mp3Bytes, (unsigned)recMs, slot);
 
     notifyNewVoice();                 // 通知 web 发 NEW_VOICE 推送（App 会来拉取）
 }
@@ -278,6 +349,8 @@ void recordAndSave() {
 void micTask(void *micParameter)
 {
     LOG("[MIC] MIC Task start\n");
+    // 清理上次录音中途崩溃/掉电残留的临时文件（否则占 flash；正常录音会覆盖它，但崩溃时不会）
+    if (LittleFS.exists(VOICE_TMP_PATH)) LittleFS.remove(VOICE_TMP_PATH);
     esp_task_wdt_add(NULL);   // 纳入 TWDT（录音循环内另有 reset，见 recordAndSave）
     MessageToMic_t  rxMsg;
 

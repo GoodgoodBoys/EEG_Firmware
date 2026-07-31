@@ -187,6 +187,11 @@ void provisionButtonFlow()
         failDeadline = millis() + PROV_FAIL_TIMEOUT_MS;
 
         g_provStage = 3;   // 阶段3：收到配置，连 WiFi 中（整行显示"连接中"）
+        // ★ 开始尝试前先推 connecting：一是让 App 明确"本轮已开始连接"，二是【覆盖掉
+        //   上一轮失败残留在 READ 特征里的 {"status":"failed"}】。否则 App 重发凭据后，
+        //   其 800ms 轮询会先读到旧的 failed 而误判本轮失败。App 只有先看到 connecting、
+        //   再看到 failed 才认定失败，故这条是失败反馈能可靠工作的前提。
+        Config.sendProvStatus("{\"status\":\"connecting\"}");
         if (tryConnect(newSsid, newPass)) {
             provisioned = true;
         } else {

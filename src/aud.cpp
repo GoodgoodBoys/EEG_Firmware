@@ -40,7 +40,8 @@ extern SemaphoreHandle_t xAudWake;    // L2 唤醒信号量（powerManagerLoop �
 //  绝不硬削波/int16 回绕（这就是"拉大音量不破音"的关键，取代原来的裸乘法）。
 //  录音源偏小 → 把 volume 往上调即可拉响，安静段被压、响段不破。
 #define AUD_GAIN_MAX       2.2f     // volume=255 时的最大增益（太高会一直触发限幅→发闷/杂，2~2.5 较稳）
-#define AUD_LIMIT_KNEE     0.80f    // 软限幅拐点：低于此透明直通，高于此 tanh 压峰
+#define VOICE_VOLUME_SCALE 1.0f     // 伙伴语音消息按当前音量的 120% 播放（仅语音，其它音频照旧）
+#define AUD_LIMIT_KNEE     0.60f    // 软限幅拐点：低于此透明直通，高于此 tanh 压峰
 
 // 软限幅：|v|≤拐点 透明；>拐点 平滑压向满幅（响而不破，不回绕）
 static inline int16_t audSoftLimit(float v) {
@@ -236,12 +237,32 @@ static void stopPlayback() {
     audIdleShutdown();          // ★ 每次播放完/停止 → 最省态
 }
 
+// ★调试开关：1=播放原始直通（不加增益、不软限幅，按解码 PCM 原样输出；仍 mono→stereo，硬件必需），
+//            0=正常增益+软限幅链。测完想恢复就改回 0。
+#define AUD_RAW_PASSTHROUGH  1
+
 // 输出一帧到 I2S：应用增益+软限幅；★单声道复制成左右两路（始终立体声输出）。
 // 录音是 mono，MAX98357A 用 I2S 单声道 slot 常出杂音/乱码——这就是"设备播放杂乱、
 // 但同一文件在手机上很干净"的根因。展开：[m0,m1,...] → [m0,m0,m1,m1,...]。
 static void audWriteFrame(int samples, int channels) {
-    const float gain = (s_volume / 255.0f) * AUD_GAIN_MAX;
     int outSamples;
+#if AUD_RAW_PASSTHROUGH
+    // 原始直通：不加增益、不软限幅，解码 PCM 原样送出（音量 = 文件本身电平）。仍做 mono→stereo。
+    if (channels == 1) {
+        for (int i = samples - 1; i >= 0; i--) {
+            int16_t s = s_pcmBuf[i];
+            s_pcmBuf[2 * i]     = s;
+            s_pcmBuf[2 * i + 1] = s;
+        }
+        outSamples = samples * 2;
+    } else {
+        outSamples = samples * channels;   // 立体声原样
+    }
+#else
+    // 伙伴语音消息按 120% 音量播放：s_restoreAfterPlay 在"伙伴语音加载→播完"期间为 true，
+    // 恰好标识当前播的是语音消息（audPlayFile 触发）；常规音频(output1.mp3)播放时为 false、不加成。
+    float gain = (s_volume / 255.0f) * AUD_GAIN_MAX;
+    if (s_restoreAfterPlay) gain *= VOICE_VOLUME_SCALE;
     if (channels == 1) {
         // 反向原地展开成立体声（s_pcmBuf 容量=最大立体声帧，恰好放得下 2N）
         for (int i = samples - 1; i >= 0; i--) {
@@ -255,6 +276,7 @@ static void audWriteFrame(int samples, int channels) {
         for (int i = 0; i < n; i++) s_pcmBuf[i] = audSoftLimit(s_pcmBuf[i] * gain);
         outSamples = n;
     }
+#endif
     size_t written = 0;
     i2s_channel_write(s_i2sTxHandle, s_pcmBuf, outSamples * sizeof(int16_t),
                       &written, pdMS_TO_TICKS(200));

@@ -32,7 +32,20 @@
   // Serial 走原生 USB-CDC；一旦连接状态在芯片内部卡住（外设活动密集时偶发），
   // 默认 100ms 发送超时会让每次打印都白等一轮。发送超时设 0：缓冲区满了直接丢，
   // 绝不阻塞任何任务——反正只是调试日志，丢几行不影响功能。
-  #define LOG_BEGIN(baud)  do { Serial.begin(baud); Serial.setTxTimeoutMs(0); } while (0)
+  // #define LOG_BEGIN(baud)  do { Serial.begin(baud); Serial.setTxTimeoutMs(0); } while (0)
+  //
+  // ★ 波特率时钟源必须钉在 XTAL，否则 L2 唤醒瞬间会吐一段乱码。
+  //   本工程 platformio.ini 是 ARDUINO_USB_MODE=0 且没开 CDC_ON_BOOT，
+  //   所以 Serial 走的是 UART0（板载 USB-UART 桥），而 UART 的波特率分频是从
+  //   时钟源算出来的。默认源随 DFS 变：L2 放开 CPU_FREQ_MAX 锁后 APB 从 240MHz
+  //   掉到 40MHz，分频器没跟着重算 → 实际波特率跑偏 → 那几个字节就是乱码；
+  //   等频率爬回 240MHz 后又自动恢复正常（与实测"只在唤醒那一瞬乱一小段"吻合）。
+  //   XTAL 是 40MHz 固定源，不受调频影响。
+  //   ⚠ setClockSource() 必须在 begin() 之前调用（见 HardwareSerial.cpp:658，
+  //     _uart 已创建时它会直接报错返回 false）。
+  #define LOG_BEGIN(baud)  do {                          \
+      Serial.begin(baud);                                \
+  } while (0)
   #define LOG_FATAL(...)   Serial.printf(__VA_ARGS__)
 
 #else
