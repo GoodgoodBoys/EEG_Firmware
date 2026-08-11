@@ -61,6 +61,7 @@ public:
     void setBool  (const char* key, bool        value);
 
     bool   save();
+    void   factoryReset();   // 恢复出厂：清配置(NVS egg_cfg + LittleFS /Config)，保留 SN 与视频后重启
     String toJsonString() const;
     void   loop();
     void   startAdvertising();
@@ -93,15 +94,14 @@ public:
     void deinitBLE();       // 配网后释放 BLE，归还 SRAM
 
 private:
-    // ---------- 文件操作 ----------
+    // ---------- 持久化（配置存 NVS；LittleFS 仅保留旧配置的迁移读取）----------
     bool   mountFS();
-    bool   loadFromFile(const char* path);
-    bool   validateJson(const char* path);
-    bool   atomicWrite(const String& jsonStr);
-    bool   restoreFromBackup();
+    bool   loadFromNvs();                  // 从 NVS 读整份配置 blob 进 _doc
+    bool   migrateLegacyFromLittleFS();    // 一次性：把旧 LittleFS /Config 配置搬进 NVS
+    bool   loadFromFile(const char* path); // 迁移用：读旧配置文件
+    bool   validateJson(const char* path); // 迁移用：校验旧配置文件
     void   initDefaultConfig();
-    bool   writeFile(const char* path, const String& content);
-    String readFile(const char* path);
+    String readFile(const char* path);     // 迁移用：读旧配置文件
 
     // ---------- 内部状态 ----------
     StaticJsonDocument<CONFIG_DOC_SIZE> _doc;

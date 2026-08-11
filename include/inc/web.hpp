@@ -22,14 +22,17 @@ void webTask(void *webParameter);
 
 // ══════════════════════════════════════════════════════════════
 //  落盘调度（persistTask）对外接口
-//    策略：作业入队后按兵不动，等「落盘窗口」再写——进 L2 放锁前 / 新传输前 / 关机前。
-//    进 L2 那一刻屏幕已休眠、IMU 已进 WoM、播放已停，但还没放锁进 light-sleep，
-//    是 flash 落盘的黄金窗口：对用户零感知、全速、且不与 light-sleep 冲突。
-//    开窗用引用计数（多个调用方可并存，如"新传输前排空"与"进 L2 前落盘"重叠）。
+//    策略：【只在 L2 空闲窗口写，任何唤醒立即打断、下次续写】。L0/L1 绝不写。
+//    powerManagerLoop 在 idle≥65s（进 L2 满 5s）开窗(persistForceAcquire) → 全速写；
+//    任何唤醒置 g_persistAbortWrite → persistTask 下一个 flash 前停手、保留 off 续写。
 // ══════════════════════════════════════════════════════════════
-void persistForceAcquire();                      // 开窗：让 persistTask 立即全速落盘
+void persistForceAcquire();                      // 开窗：允许 persistTask 全速落盘（idle≥65s）
 void persistForceRelease();                      // 关窗（与 acquire 成对）
-bool persistIsPending();                         // 是否仍有在途落盘作业
-void persistFlushBlocking(uint32_t timeoutMs);   // 阻塞排空（关机前用）
+bool persistIsPending();                         // 是否仍有待落盘内容
+void persistFlushBlocking(uint32_t timeoutMs);   // 阻塞排空（关机前用，忽略打断写到完）
+
+// ★ 唤醒立即打断落盘写入：markActivity()（V1_1.cpp）与 imuWoMISR()（imu.cpp，IRAM）置位。
+//   persistTask 每个 flash 操作前查它，置位即停手保留 off；开窗时由 powerManagerLoop 清零。
+extern volatile bool g_persistAbortWrite;
 
 #endif

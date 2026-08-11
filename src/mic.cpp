@@ -8,6 +8,7 @@
 #include "inc/mp3enc.hpp"   // Shine MP3 编码器封装（隔离其全局枚举，避免与 msg.hpp 冲突）
 #include "inc/debug.hpp"
 #include "esp_task_wdt.h"   // 任务级看门狗：卡死时 panic backtrace 直接点名本任务
+#include "inc/health.hpp"   // 运行期阶段打点（TWDT 超时时会被冻成快照）
 
 // 16kHz 单声道语音，64kbps 音质更干净；30s ≈ 240KB（10 条 2.4MB 够存）
 // ⚠ 试过 128kbps：录音完全没声音（实测）。原因见下方 shine 缓冲区分析——
@@ -48,7 +49,7 @@
 //   2~6kHz 有谐振峰，正好放大这段嘶声（手机喇叭频响宽 + 有 DSP，所以同一文件在
 //   App 里听不出来）。0.08 ≈ -22dB，静音段基本听不到，仍不是全静音、不会把
 //   小声说话整段切掉。
-#define MIC_GATE_FLOOR     0.08f     // 门关时降到 8%（≈-22dB）
+#define MIC_GATE_FLOOR     0.30f     // 门关时降到 8%（≈-22dB）
 #define MIC_ENV_A          0.02f
 // ★ SMOOTH 0.03→0.008：门压得更深后，开关速度必须放慢，否则语气停顿处会听到
 //   底噪一下一下地"抽气"（pumping）。0.008 @16kHz ≈ 8ms 时间常数，跟得上语句
@@ -105,10 +106,11 @@ extern QueueHandle_t qMainToMic; // message queue |  main -> microphone
 extern QueueHandle_t qMicToMain; // message queue |  microphone -> main
 extern QueueHandle_t qMainToWeb; // 录完发 NEW_VOICE 给 webTask（触发推送）
 
-// web.cpp：App 当前正在发送的语音槽（-1=空闲）。环形淘汰最旧时跳过它，避免删到正被读的文件。
-extern volatile int g_voiceSendingId;
-// web.cpp：复用槽（环形淘汰）前清掉该槽旧 uid，保证 App 端不把新语音当旧的重发去重。
-extern void voiceSlotResetUid(int slot);
+// web.cpp：该槽是否正被【任一通路】(App / 伙伴)发送。环形淘汰要跳过它，避免删到正被读的文件。
+// ★ 取代原来的 g_voiceSendingId 单值判断——那个只保护 App 通路，伙伴通路的槽会被误淘汰。
+extern bool voiceSlotBusy(int slot);
+// web.cpp：录音提交后登记到出站账本（分配 uid、两个目的地各置为待投递）。
+extern void voiceEnqueue(int slot);
 
 // 录音音量表（lcd.cpp 定义并绘制）：录音时置位并写实时电平，LCD 据此画音量动画
 extern volatile bool g_micMeterActive;
@@ -132,14 +134,14 @@ static int findFreeVoiceSlot() {
 
 // 满槽时挑"最旧"的一条淘汰（环形队列：丢队头、腾位给新录音，保留最近 VOICE_MAX 条）。
 // 判据：getLastWrite() 最小者最旧；时间未同步/相等时天然退化为最小编号（先扫到先选中）。
-// ★ 跳过当前正被 App 发送的槽（g_voiceSendingId），避免删掉 webTask 正在读的文件。
+// ★ 跳过当前正被【任一通路】发送的槽（voiceSlotBusy），避免删掉 webTask 正在读的文件。
 // 返回 -1 = 没有可淘汰的槽（极端：全部都在发送中，几乎不可能，因为一次只发一条）。
 static int pickOldestVoiceSlot() {
     int    bestSlot = -1;
     time_t bestTime = 0;
     char   path[24];
     for (int i = 0; i < VOICE_MAX; i++) {
-        if (i == g_voiceSendingId) continue;   // 别删正在发送的那条
+        if (voiceSlotBusy(i)) continue;        // 别删任一通路正在发送的那条
         snprintf(path, sizeof(path), VOICE_PATH_FMT, i);
         File f = LittleFS.open(path, FILE_READ);
         if (!f) continue;
@@ -244,6 +246,7 @@ void recordAndSave() {
     bool stop = false;
     while (!stop) {
         esp_task_wdt_reset();   // 录音最长连续 30s，须在此喂狗（主循环的 reset 期间不触发）
+        healthSetTaskStage(HT_MIC, HS_M_RECORD);   // 采集 + 编码 + 写文件，都在这一轮里
         if (millis() - startMs >= RECORD_MAX_MS) {
             LOG("[MIC] 达到最长时长 %us，自动停止\n", RECORD_MAX_MS / 1000);
             break;
@@ -347,7 +350,7 @@ void recordAndSave() {
         LittleFS.remove(VOICE_TMP_PATH);
         return;
     }
-    voiceSlotResetUid(slot);
+    voiceEnqueue(slot);   // 登记出站账本：分配 uid、App/伙伴两路各置为待投递
 
     LOG("[MIC] ✓ 保存完成: %s  原始 %u 采样 -> MP3 %u 字节 时长 %ums（槽 %d）\n",
         voicePath, (unsigned)rawSamples, (unsigned)mp3Bytes, (unsigned)recMs, slot);
@@ -365,6 +368,7 @@ void micTask(void *micParameter)
 
     while (true) {
         esp_task_wdt_reset();   // 空闲每 50ms 喂狗
+        healthSetTaskStage(HT_MIC, HS_M_IDLE);
         if (xQueueReceive(qMainToMic, &rxMsg, 0) == pdTRUE) {
             LOG("[MIC] 收到指令，CMD=%d\n", rxMsg.cmd);
             if (rxMsg.cmd == MIC_START && !s_recording) {

@@ -100,6 +100,13 @@ void lcdStopBootSpinner();
 // 全屏显示"没电"图标 holdMs 毫秒（亮度 50）。关机休眠态长按开机、复检仍没电时用。
 // 纯净环境可调用（内部自行 tft.init，不预加载视频）；显示完关背光，调用方随后 esp_restart。
 void lcdShowLowBatteryScreen(uint32_t holdMs);
+
+// OTA 升级进度屏（纯净 OTA 环境调用，内部自行 tft.init、不预加载视频）。
+// 文字用英文——LovyanGFX 默认字库无中文。
+void lcdOtaBegin();                    // 初始化 + 画标题 + 空进度条框
+void lcdOtaProgress(int pct);          // 更新进度条 + 百分比（0~100）
+void lcdOtaMessage(const char* msg);   // 底部一行英文状态（WiFi.../Retry/Failed/...）
+
 const lcdStats_t* lcdGetStats();
 
 /** web 任务下载完新视频后调用，通知 LCD 重新加载 target 视频 */

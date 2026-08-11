@@ -28,7 +28,7 @@
 #include <Preferences.h>
 
 // ★★★ 改这里：这台设备要烧的 SN（必须 8 位纯数字）★★★
-#define TARGET_SN "00000002"
+#define TARGET_SN "00000005"
 
 // —— 下面与固件保持一致，别动 ——
 #define NVS_SN_NAMESPACE "device_info"

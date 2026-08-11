@@ -9,6 +9,7 @@
 #include "driver/gpio.h"
 #include "soc/gpio_struct.h"   // ISR 里直接写 GPIO.pin[n].int_ena（IRAM 安全，见 imuWoMISR）
 #include "inc/debug.hpp"   // ★ 放在库头之后，使 LOG / LOG_FATAL / _DEBUG 生效
+#include "inc/health.hpp"  // 运行期阶段打点（TWDT 超时时会被冻成快照）
 
 static QMI8658 imu;
 
@@ -17,6 +18,7 @@ extern QueueHandle_t qPosStream;
 extern volatile bool g_posStreaming;
 extern volatile int  g_pwrTier;   // 0/1/2 功耗档位（V1_1.cpp 定义）
 extern volatile bool g_xfering;   // web.cpp：视频/音频下载传输中（传输期识别被屏蔽，降采样减 I2C 卡死概率）
+extern volatile bool g_persistAbortWrite;  // web.cpp：唤醒立即打断落盘写入（IMU 运动最早在本 WoM ISR 置位）
 extern void mainWake();           // 唤醒主循环（V1_1.cpp）
 
 // ═══════════════════════════════════════════════════════════════
@@ -306,6 +308,10 @@ void IRAM_ATTR imuWoMISR() {
     //   （sdkconfig 里 CONFIG_GPIO_CTRL_FUNC_IN_IRAM 未开），flash 操作期间调用会崩。
     //   这一行等价于 gpio_ll_intr_disable()，是 static inline 的同款实现。
     GPIO.pin[IMU_INT1].int_ena = 0;
+    // ★ IMU 运动的最早打断点：置位后 persistTask（core1）在下一个 flash 操作前就停手，
+    //   把 core0 立刻还给醒来的 imuTask 做高频采样，避免落盘冻结吃掉动作唤醒的头几拍。
+    //   g_persistAbortWrite 是普通 DRAM volatile，IRAM ISR 里写它安全（不碰 flash）。
+    g_persistAbortWrite = true;
     if (s_imuTaskHandle) {
         BaseType_t hpw = pdFALSE;
         vTaskNotifyGiveFromISR(s_imuTaskHandle, &hpw);
@@ -659,6 +665,7 @@ void imuTask(void *)
     while (true)
     {
         esp_task_wdt_reset();   // 喂狗（WoM 待机期已退订 TWDT，见下方阻塞点）
+        healthSetTaskStage(HT_IMU, HS_I_SAMPLE);
         // ★ L0 和 L1 都按"醒着"处理：250Hz 全采、不进 WoM。
         //   L1 只是把屏幕压到 60% 亮度，CPU 仍持 240MHz 锁、屏幕也还亮着，本就不是深度
         //   省电档；让 IMU 在这一档进 WoM 反而有个坏处：拍/摇要先触发 WoM 中断、退 WoM、
@@ -697,7 +704,9 @@ void imuTask(void *)
             //     按键/App 把设备拉回 L0 时能把这里叫醒，最坏情况也只是"摇不醒、但按键能救"。
             //   ⚠ 必须先退订 TWDT：无限阻塞期间无人喂狗，8s 看门狗会 panic 重启。
             esp_task_wdt_delete(NULL);
+            healthSetTaskStage(HT_IMU, HS_I_STANDBY);   // 无限阻塞（已退订 TWDT，不会被点名）
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            healthSetTaskStage(HT_IMU, HS_I_WOM);       // 醒来：持锁 + 退 WoM（I2C 事务）
             esp_task_wdt_add(NULL);
             imuI2cLock(true);                           // ★ 醒来先持锁，保恢复/采样 I2C
             imuExitWoM();                               // 恢复 250Hz（持锁中，不会卡 21Hz→39Hz）

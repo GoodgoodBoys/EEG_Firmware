@@ -56,10 +56,10 @@ extern SemaphoreHandle_t xAudWake;    // L2 唤醒信号量（powerManagerLoop �
 //   压过一道），不补一点会明显偏小。峰值超出的部分由 audSoftLimit 平滑压住，不会硬削波。
 //   ★ 若听到破音就往下调（1.5 / 1.3）——那说明该条录音本身电平已经很高，
 //     2 倍把大半波形推进了 tanh 压缩区（这正是之前 AUD_GAIN_MAX=2.2 时破音的机理）。
-#define VOICE_VOLUME_SCALE 1.5f     // 伙伴语音消息相对当前音量的额外系数
+#define VOICE_VOLUME_SCALE 1.9f     // 伙伴语音消息相对当前音量的额外系数
 // 拐点 0.60→0.85：限幅器应当是"极少触发的安全网"，不是音色塑形器。0.60 意味着
 // −4.4dBFS 以上全被压，正常语音大半时间都在压缩区。
-#define AUD_LIMIT_KNEE     0.85f    // 软限幅拐点：低于此透明直通，高于此 tanh 压峰
+#define AUD_LIMIT_KNEE     0.95f    // 软限幅拐点：低于此透明直通，高于此 tanh 压峰
 
 // 软限幅：|v|≤拐点 透明；>拐点 平滑压向满幅（响而不破，不回绕）
 static inline int16_t audSoftLimit(float v) {

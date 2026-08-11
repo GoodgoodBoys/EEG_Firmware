@@ -2,6 +2,7 @@
 #include "inc/fs.hpp"
 #include "inc/lcd.hpp"
 #include "inc/configSys.hpp"
+#include "inc/health.hpp"   // 启动阶段打点：把预加载细分到"哪个视频文件"
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"   // 任务级看门狗：卡死时 panic backtrace 直接点名本任务
 
@@ -437,6 +438,7 @@ static int player()
 
         frameEntry_t& fe = slot.frameIndex[currentFrame];
 
+        healthSetTaskStage(HT_LCD, HS_L_DECODE);   // JPEG 解码 + SPI DMA 推屏
         if (batOverlayActive()) {
             frameCanvas.drawJpg(slot.data + fe.offset, fe.size, 0, 0); // 解码进 PSRAM 缓冲
             drawOverlaysOn(frameCanvas);                               // 缓冲上合成电量 + 配对爱心
@@ -617,8 +619,11 @@ static void processMessage(MessageToLCD_t& rxMsg, bool& msgPending, int& playCou
 //  target 视频热重载
 // ══════════════════════════════════════════════════════════════
 
+// ★ 打点在函数体第一行（见下）：重载要读整个 target.mjpeg 并重建帧索引，是 lcdTask
+//   少数会长时间不返回的路径之一。
 static void reloadTargetVideo()
 {
+    healthSetTaskStage(HT_LCD, HS_L_RELOAD);
     LOG("[LCD] target 视频热重载...\n");
 
     // target 固定在 slot 7（最后一个）
@@ -952,6 +957,53 @@ void lcdShowLowBatteryScreen(uint32_t holdMs)
 }
 
 // ══════════════════════════════════════════════════════════════
+//  OTA 升级进度屏（纯净环境：内部自行 tft.init，不预加载视频）
+//  文字用英文——LovyanGFX 默认字库无中文，中文会画不出来。
+// ══════════════════════════════════════════════════════════════
+static int s_otaBarX = 30, s_otaBarY = 150, s_otaBarW = 260, s_otaBarH = 24;
+
+void lcdOtaBegin() {
+    tft.init();
+    tft.setRotation(LCD_ROTATION);
+    tft.setBrightness(0);                       // 先灭再画，避免点亮瞬间花屏
+    tft.fillScreen(0x0000);                     // 黑底
+    const uint16_t white = tft.color565(255, 255, 255);
+    const int W = tft.width(), H = tft.height();
+    tft.setTextColor(white);
+    tft.setTextSize(2);
+    tft.setCursor(W / 2 - 54, H / 2 - 48);
+    tft.print("FW UPDATE");
+    s_otaBarW = W - 60; s_otaBarH = 24;
+    s_otaBarX = 30;     s_otaBarY = H / 2 - 6;
+    tft.drawRect(s_otaBarX, s_otaBarY, s_otaBarW, s_otaBarH, white);
+    tft.setBrightness(90);
+}
+
+void lcdOtaProgress(int pct) {
+    if (pct < 0)   pct = 0;
+    if (pct > 100) pct = 100;
+    const uint16_t green = tft.color565(0, 220, 90);
+    const uint16_t white = tft.color565(255, 255, 255);
+    const int fillW = (s_otaBarW - 4) * pct / 100;
+    tft.fillRect(s_otaBarX + 2, s_otaBarY + 2, fillW, s_otaBarH - 4, green);
+    tft.fillRect(s_otaBarX, s_otaBarY + s_otaBarH + 8, 80, 20, 0x0000);   // 清旧数字
+    tft.setTextColor(white);
+    tft.setTextSize(2);
+    tft.setCursor(s_otaBarX, s_otaBarY + s_otaBarH + 8);
+    tft.printf("%d%%", pct);
+}
+
+void lcdOtaMessage(const char* msg) {
+    const uint16_t white = tft.color565(255, 255, 255);
+    const int W = tft.width(), H = tft.height();
+    tft.fillRect(0, H - 34, W, 34, 0x0000);
+    tft.setTextColor(white);
+    tft.setTextSize(1);
+    tft.setCursor(10, H - 26);
+    tft.print(msg);
+}
+
+// ══════════════════════════════════════════════════════════════
 //  配对爱心叠加：两颗粉色爱心（一大一小重叠）——已互绑且伙伴在线时显示
 // ══════════════════════════════════════════════════════════════
 extern volatile bool g_pairLinked;     // web.cpp：已互绑 且 伙伴在线
@@ -1169,10 +1221,15 @@ void lcdInit()
     };
 
     for (auto& item : preloadList) {
+        // ★ 打点到【具体哪个文件】：预加载是启动期耗时最长的环节，读的又是 flash 上
+        //   可能被上次崩溃写坏的内容（/target.mjpeg 由延后落盘写入，写一半掉电就是半截）。
+        //   崩在这里时 stage 直接指出是哪一个视频，不必接串口逐个试。
+        healthSetStage(BS_LCD_PRELOAD + item.slot);
         if (!loadVideoToCache(item.slot, item.path)) {
             LOG("[LCD] ⚠ 跳过: %s\n", item.path);
         }
     }
+    healthSetStage(BS_LCD_DONE);
 
     // ── 汇总统计 ──
     stats.poolUsed = poolUsed;
@@ -1692,6 +1749,7 @@ void lcdTask(void *lcdParameter)
     
     while (true) {
         esp_task_wdt_reset();   // 喂狗：每帧一次（含 L2 阻塞 500ms 唤醒后回到这里）
+        healthSetTaskStage(HT_LCD, HS_L_IDLE);   // 每帧回到这里重置，下面各阶段再覆盖
         frameStartTime = millis();
 
         // ── 接收消息 ──

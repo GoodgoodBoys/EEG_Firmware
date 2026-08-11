@@ -39,12 +39,18 @@ static bool          servoAttached   = false;
 static bool          servoPowered    = false;
 static unsigned long lastServoMoveMs = 0;
 
+// ★ 最近一次 servoPowerOn() 是否【真的执行了上电】（而不是已上电直接返回）。
+//   调用方据此识别"这一拍是把舵机从断电态唤醒的第一拍"——那一拍需要额外的
+//   保留时间，见 V1_1.cpp 的 SERVO_FIRST_SWING_HOLD_MS。
+static bool servoJustPoweredOn = false;
+
 // 供电轨开关：断电即彻底省电（无 PWM 时也不再耗电），用前需重新上电
 static inline void servoPowerOn()
 {
-  if (servoPowered) return;
+  if (servoPowered) { servoJustPoweredOn = false; return; }
   digitalWrite(SERVO_POWER_PIN, HIGH);
   servoPowered = true;
+  servoJustPoweredOn = true;
   delay(SERVO_POWER_SETTLE_MS);      // 等供电轨稳定，避免舵机上电瞬间乱抖
   LOG("[SERVO] 供电轨已开启\n");
 }

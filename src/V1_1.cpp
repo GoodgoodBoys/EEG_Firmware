@@ -14,6 +14,8 @@
 #include "inc/configSys.hpp"
 #include "inc/nvs_sn.h"
 #include "inc/provision.hpp"
+#include "inc/health.hpp"
+#include "inc/ota.hpp"
 #include "esp_pm.h"
 #include <WiFi.h>
 #include "esp_sleep.h"
@@ -43,6 +45,30 @@
 // 避免用户长按误触发 BOOT 启动选择脚。
 #define PROV_BUTTON_PIN     2        // Button1（IO2）微动开关
 #define PROV_LONG_PRESS_MS  2000     // 长按 2 秒
+
+// 主循环每轮从 qWebToMain 排空的上限（条数 + 时间预算，见 loop() 里的说明）
+#define QWEB_DRAIN_PER_LOOP   4
+#define QWEB_DRAIN_BUDGET_MS  50
+
+// ══════════════════════════════════════════════════════════════
+//  舵机「首拍保留」：只针对把舵机从断电态唤醒的那一次摆动
+//
+//  成因：servoLoop 会在"中位静止 1 秒"后 detach + 断开供电轨，所以隔一会儿再摇，
+//  舵机是从【断电态】起步的。而供电轨稳定只等了 SERVO_POWER_SETTLE_MS(20ms)，
+//  舵机内部 MCU 启动 + 初始定位还要上百毫秒 —— 这期间写进去的 PWM 等于打空。
+//  若此时 App 松手的回中位紧跟着到（qServoCmd 是深度 1 的覆盖队列，取的永远是
+//  最新一条），舵机就直接归中位了，用户【完全看不到这次摆动】。
+//
+//  做法：这一拍执行后开一个保留窗，窗内主循环【暂不从 qServoCmd 取新指令】，
+//  让舵机把这一拍走完；窗口结束再取——那时队列里自然是最新的那条（通常就是
+//  回中位），语义和原来完全一致，只是晚了这一小段。
+//
+//  ★ 只对首拍生效：窗口关闭后 g_servoSwingHoldUntil 归零，后续摆动一律走原路径，
+//    不引入任何延迟——连续快速摆动时舵机本就在工作态，再加延迟只会拖沓。
+//  ★ 不阻塞主循环：只是跳过"取舵机队列"这一步，按键/电量/功耗状态机照常运行。
+// ══════════════════════════════════════════════════════════════
+#define SERVO_FIRST_SWING_HOLD_MS  250   // 覆盖"内部就绪 + 转过 35°"所需时间
+static uint32_t g_servoSwingHoldUntil = 0;   // 保留窗截止时刻（0 = 无保留）
 
 #define BAT_ADC_PIN         5
 #define BAT_DIVIDER         3.128f      // (100k+47k)/47k
@@ -75,8 +101,17 @@ volatile uint32_t g_bootId = 0;
 // NVS SN
 NvsSn g_sn;
 
-// 传输锁标志：传输期间屏蔽 IMU 等触发的播放请求
-static bool xferLocked = false;
+// ★ 传输锁：直接读 webTask 的 g_xfering，不再维护本地 xferLocked 副本。
+//   原来是 webTask 经 qWebToMain 发 XFER_LOCK/UNLOCK、主循环据此翻转一个本地 bool。
+//   但那是【跨任务的成对状态迁移经过一条会丢消息的队列】——UNLOCK 丢一次就永久锁死
+//   （forceActive 永不休眠 2.2mA→几十mA + VIDEO_SHOW/RECORD/SERVO 全被屏蔽，只能重启）。
+//   而 xferLocked 的全部 6 处用途都只是在问"是否正在传输"，g_xfering 正是这个语义、
+//   且是 webTask 直接写的变量、不经队列 —— 那个本地副本纯属冗余。
+//   直接用它以后失配在结构上不可能发生，也顺带覆盖了反向失配（LOCK 丢失 → 传输期没停播）。
+//   XFER_LOCK/UNLOCK 消息保留：它们还要触发【副作用】(AUD_STOP、LCD 切待机)，只是不再管状态。
+//   附带好处：起止都比消息往返早一拍，屏蔽窗口更准。
+extern volatile bool g_xfering;          // web.cpp：传输进行中（enterTransferMode/exitTransferMode 直接写）
+#define xferLocked  (g_xfering)
 
 static esp_pm_lock_handle_t s_freqLock = nullptr;
 static bool s_freqLockHeld = false;
@@ -97,7 +132,6 @@ QueueHandle_t qMainToWeb;
 QueueHandle_t qMainToAud;
 QueueHandle_t qMainToMic;
 
-QueueHandle_t qLcdToMain;
 QueueHandle_t qWebToMain;
 QueueHandle_t qServoCmd;   // 舵机专用深度1覆盖队列：连发 SERVO 只应用最新角度，不占 qWebToMain、不溢出丢播放指令
 QueueHandle_t qImuToMain;
@@ -149,7 +183,9 @@ static int      g_curTier        = 0;
 static bool g_hasUnreadMsg = false;
 static bool g_envelopeMode = false;
 
-static inline void markActivity() { g_lastActivityMs = millis(); }
+// ★ 任何可感知活动 → 记录时刻 + 立即打断在写的落盘（唤醒时不让 flash 冻结 core0 卡渲染/动作）。
+//   IMU 运动更早的打断在 imuWoMISR（硬件中断）里，这里覆盖按键/App/摇拍分类后等所有活动。
+static inline void markActivity() { g_lastActivityMs = millis(); g_persistAbortWrite = true; }
 
 // 轻量抬频:持锁=240MHz；放锁=自动 40MHz + light-sleep。绝不调用 esp_pm_configure。
 static inline void cpuBoost(bool on)
@@ -214,9 +250,12 @@ static bool s_pmHoldsPersist = false;
 static void persistWindowUpdate(bool want)
 {
     if (want && !s_pmHoldsPersist) {
+        // ★ 开窗即清打断标志：此刻已 idle≥65s（65s 无任何活动），之前那次唤醒留下的
+        //   g_persistAbortWrite 已是陈旧信号，清掉让 persistTask 能开写/续写。
+        g_persistAbortWrite = false;
         persistForceAcquire();
         s_pmHoldsPersist = true;
-        LOG("[PWR] ⏸ 进 L2 前先落盘（保持 240MHz + 禁 light-sleep）\n");
+        LOG("[PWR] ⏸ 进 L2 满 5s，开窗落盘（保持 240MHz + 禁 light-sleep）\n");
     } else if (!want && s_pmHoldsPersist) {
         persistForceRelease();
         s_pmHoldsPersist = false;
@@ -285,18 +324,21 @@ static void powerManagerLoop()
     //   语音上行 → 即使 L2（屏已休眠）也持锁 240MHz 保上行吞吐，屏幕照常灭
     // 信封态：降频到 40MHz（省电）+ 持禁睡锁禁 light-sleep（否则背光闪、推屏被打断）。
     // ══════════════════════════════════════════════════════════════
-    //  进 L2 前的「落盘黄金窗口」
-    //    此刻屏幕已休眠停渲染、IMU 已进 WoM、播放早已停止（L2 = 60s 无活动），
+    //  「落盘黄金窗口」= 进 L2 满 5s（idle≥65s）
+    //    此刻屏幕已休眠停渲染、IMU 已进 WoM、播放早已停止（L2 = 60s 无活动，再等 5s 稳态），
     //    各任务也都已降到最低轮询频率——但【还没放锁进 light-sleep】。
     //    这是全系统最空闲、却仍全速(240MHz)的唯一时机：落盘对用户零感知、最快写完，
     //    且不会与 light-sleep 冲突（flash 撞 light-sleep 的坑同 IMU 的 I2C 那个 259）。
-    //    落盘未完成前不放锁；写完后下一轮自然进 L2，无需额外状态机。
+    //    落盘未完成前不放锁；写完后下一轮自然进 light-sleep，无需额外状态机。
+    //    ★ 多等 5s：刚进 L2 就写、用户马上又醒会白打断一次；等 5s 稳态再写，抖动更少。
+    //      被唤醒打断的落盘保留 off，下次进这个窗口续写（见 web.cpp persistWriteSlot）。
     //
     //  ★ 窗口管理走统一的 persistWindowUpdate()：本函数有多个出口（上面的 forceActive
     //    提前 return、下面的信封态分支），任一出口漏 release 都会让计数泄漏、窗口永久开着。
-    //  ★ 信封态不开窗：那时屏幕 60% 亮着播信封动画，落盘会掉帧；等退出或兜底超时再写。
+    //  ★ 信封态不开窗：那时屏幕 60% 亮着播信封动画，落盘会掉帧；等退出信封再写。
     // ══════════════════════════════════════════════════════════════
-    bool persistWindow = (tier == 2 && !envelope && !g_voiceSending && persistIsPending());
+    bool persistWindow = (idle >= PWR_IDLE_L2_MS + 5000 &&
+                          !envelope && !g_voiceSending && persistIsPending());
     persistWindowUpdate(persistWindow);
 
     if (envelope) {
@@ -481,6 +523,332 @@ static void printStackHWM(const char* name, TaskHandle_t h, uint32_t cfgBytes)
 RTC_NOINIT_ATTR static uint32_t s_shutdownFlag;
 #define SHUTDOWN_MAGIC   0x5D0117AAu
 
+// ══════════════════════════════════════════════════════════════
+//  健康黑匣子（RTC 慢速内存）
+//
+//  为什么放 RTC 内存：串口 LOG 在这个板子上不可用于长期监控 ——
+//  ARDUINO_USB_CDC_ON_BOOT=1 时 Serial 走 USB CDC，设备一进 light-sleep
+//  USB 外设掉电、主机端连接断开，之后所有日志都收不到。而 RTC_NOINIT 段在
+//  light-sleep / deep-sleep / 软复位 / TWDT panic 重启 之后【全部保留】
+//  （只有真正掉电才丢），是唯一能跨越崩溃把现场带出来的存储。
+//
+//  记录的是【历史最差值】而不是当前值：崩溃前最后一刻的采样多半发不出去，
+//  但"曾经跌到过多少"能跨重启累积，重启后由 webTask 通过 MQTT 上报。
+//  碎片化就是靠 minLargestBlk 的长期走势判断的。
+// ══════════════════════════════════════════════════════════════
+// 内部 RAM"最大连续块"低水位告警线。与资源监控里那条 ⚠⚠ 日志同值：
+// I2S DMA 环(16KB)、MQTT 缓冲(8KB) 都在这个量级，跌破即意味着大块分配随时会失败。
+#define HEALTH_LOWBLK_WARN  (20 * 1024)
+
+#define HEALTH_MAGIC  0x484C5404u      // "HL\4"，结构变更时改这个数使旧数据失效
+                                       // （\2→\3：新增 lastStage/curStage）
+                                       // （\3→\4：新增 TWDT 现场 + 运行期阶段 + 低水位快照）
+
+typedef struct {
+    uint32_t magic;
+    uint32_t bootCount;        // 累计启动次数
+    uint32_t crashCount;       // 非正常复位次数（panic / 各种看门狗 / 欠压）
+    uint32_t lastReset;        // 上次复位原因 esp_reset_reason()
+    uint32_t lastUptimeSec;    // 本次已运行多久（healthBoxSample 每 5s 刷新）
+    // ★ 上次【崩溃前】撑了多久。必须单独存一格：lastUptimeSec 会被本次运行每 5s 覆盖，
+    //   等到 MQTT 连上去上报时它早就等于本次的 up 了 —— 直接报它等于报了个废值。
+    //   healthBoxInit 在本次第一次采样之前把它转存到这里，语义才成立。
+    uint32_t prevUptimeSec;
+    uint32_t maxUptimeSec;     // 历史最长连续运行
+    uint32_t minFreeHeap;      // 历史最小空闲内部堆
+    uint32_t minLargestBlk;    // ★ 历史最小"最大连续块" —— 碎片化的关键指标
+    uint32_t minFreePsram;
+    uint32_t minPsramBlk;
+    uint16_t stkMinFree[6];    // 各任务栈历史最小剩余（loop/IMU/WEB/LCD/AUD/MIC）
+    uint32_t selfHealHits;     // 语音子系统自检命中次数（>0 = 有未预料的卡死路径）
+    // ── 启动阶段标记（见 health.hpp 的成因说明）──
+    uint32_t curStage;         // 本次进行到哪一步（setup 边走边写）
+    uint32_t lastStage;        // 上次【停在】哪一步 —— 崩溃现场的唯一线索
+
+    // ── 运行期阶段：每任务一格，见 health.hpp 的 HealthTaskSlot ──
+    uint8_t  taskStage[HT_SLOTS];   // 本次运行的实时值（被 TWDT 的 ISR 读取）
+    uint8_t  wdtStage[HT_SLOTS];    // ★ 看门狗超时【那一刻】的快照
+
+    uint32_t wdtCount;         // TWDT 累计触发次数（跨重启）
+
+    // ── 内部 RAM 低水位快照 ──
+    //   原来只记 minLargestBlk 一个孤立数字，看得到"曾经跌到 1908"，却不知道
+    //   何时跌的、当时在干什么。这里在【首次跌破阈值】那一刻抓一份现场。
+    uint32_t lowBlkAt;         // 发生时刻（uptime 秒；0 = 从未发生）
+    uint32_t lowBlkBoot;       // 发生在第几次启动 —— 快照跨重启保留，缺了它就分不清
+                               //   "3000 秒" 是本次的还是三次重启之前的
+    uint32_t lowBlkVal;        // 当时的最大连续块
+    uint32_t lowBlkHeap;       // 当时的空闲内部堆
+    uint8_t  lowBlkStage[HT_SLOTS];  // 当时各任务在干什么
+} HealthBox;
+RTC_NOINIT_ATTR static HealthBox g_hb;
+
+// 打一个启动阶段点。★ 必须是真实写入 RTC 内存的一条 store：g_hb 在 RTC_NOINIT 段，
+// panic / 看门狗 / 软复位都不清它，所以赋值语句一执行完，现场就已经保住了。
+// ★ 编译屏障：这个值【只写不读】，正常控制流下没有任何代码依赖它，理论上允许编译器
+//   把连续几次赋值合并成最后一次。而本机制的全部价值恰恰在于"崩溃那一刻它是多少"。
+//   屏障成本为零（不生成指令），只是禁止跨过它做重排/合并。不用 volatile 是因为
+//   那会让 healthBoxInit 里的 memset(&g_hb,...) 触碰 volatile 成员，属于未定义行为。
+void healthSetStage(uint32_t stage)
+{
+    g_hb.curStage = stage;
+    asm volatile("" ::: "memory");
+}
+
+// 运行期阶段打点：每任务一格，见 health.hpp。成本 = 一条 store，可放热路径。
+// 越界静默忽略（宁可少一条诊断信息，也不能让诊断代码本身写坏内存）。
+void healthSetTaskStage(uint8_t slot, uint8_t stage)
+{
+    if (slot >= HT_SLOTS) return;
+    g_hb.taskStage[slot] = stage;
+    asm volatile("" ::: "memory");
+}
+
+// ══════════════════════════════════════════════════════════════
+//  TWDT 超时现场（覆盖 IDF 的 weak 钩子，超时时在中断上下文被调用）
+//
+//  解决黑匣子最大的盲区：reset="任务看门狗" 只说明"有人没喂狗"，答不出是谁、
+//  更答不出当时在干什么。这里把 taskStage 冻成快照，重启后随健康 JSON 带出来。
+//
+//  ★★ 本函数【只做 RTC 内存读写】，一条外部函数都不调 —— 这是刻意的：
+//     我们最怀疑的故障场景正是 persistTask 写 flash 导致 core0 cache 冻结，
+//     那种时刻任何落在 flash 里的代码（pcTaskGetName / xTaskGetCurrentTaskHandleForCore
+//     都在 flash）一旦被取指就会二次崩溃 —— 诊断代码反而把原始现场掩盖成 panic。
+//     RTC slow memory 不经 flash cache，读写在任何上下文都成立。
+//     代价是拿不到任务名，但 taskStage 已经能回答"每个任务卡在哪一步"，够用。
+//  ★ 同理不取内存水位：heap_caps_* 要拿堆锁，在 ISR 里可能死锁。
+// ══════════════════════════════════════════════════════════════
+extern "C" void esp_task_wdt_isr_user_handler(void)
+{
+    g_hb.wdtCount++;
+    for (int i = 0; i < HT_SLOTS; i++) g_hb.wdtStage[i] = g_hb.taskStage[i];
+}
+
+const char* healthStageName(uint32_t s)
+{
+    if (s >= BS_LCD_PRELOAD && s < BS_LCD_PRELOAD + 8) {
+        // 与 lcd.cpp 的 preloadList 顺序严格一致（改那边记得同步改这里）
+        static const char* kVid[8] = { "idle", "nod", "swingSwing", "showUp",
+                                       "wink", "startSleep", "sleeping", "target" };
+        static char buf[40];
+        snprintf(buf, sizeof(buf), "预加载视频[%u] %s",
+                 (unsigned)(s - BS_LCD_PRELOAD), kVid[s - BS_LCD_PRELOAD]);
+        return buf;
+    }
+    switch (s) {
+        case BS_NONE:     return "无记录";
+        case BS_FS:       return "挂载LittleFS";
+        case BS_SN:       return "SN校验";
+        case BS_PM:       return "电源管理";
+        case BS_CFG_BLE:  return "配置+BLE";
+        case BS_LCD_INIT: return "LCD初始化";
+        case BS_LCD_DONE: return "预加载收尾";
+        case BS_AUD:      return "音频初始化";
+        case BS_MIC:      return "麦克风初始化";
+        case BS_IMU:      return "IMU初始化";
+        case BS_SERVO:    return "舵机上电归中位";
+        case BS_BAT:      return "电量ADC";
+        case BS_QUEUE:    return "创建队列";
+        case BS_TASKS:    return "创建任务";
+        case BS_RUNNING:  return "运行期";
+        case BS_SHUTDOWN: return "正常关机";
+        default:          return "未知";
+    }
+}
+
+volatile uint32_t g_selfHealHits = 0;   // web.cpp 的 voiceSelfCheck 命中时 ++
+
+// web.cpp / lcd.cpp 的诊断量（定义在各自文件，这里只读）
+extern volatile uint32_t g_lastAnyRxMs, g_mqttFailCnt, g_mqttFailBlk;
+extern volatile int32_t  g_mqttLastErr;
+extern volatile uint32_t g_netRecoverCnt, g_netRebootCnt;
+// g_sprFail 原定义在 lcd.cpp 的 sprite 预分配逻辑里，该逻辑已回退。这里就地占位（恒为 0），
+// 保持健康上报 JSON 的字段结构不变；日后重做 sprite 预分配时再把定义移回 lcd.cpp。
+volatile uint32_t g_sprFail = 0;
+
+// 内部 RAM 的空闲块数量 —— 碎片化最直观的指标（块多且小 = 碎）
+static uint32_t healthFreeBlocks() {
+    multi_heap_info_t hi;
+    heap_caps_get_info(&hi, MALLOC_CAP_INTERNAL);
+    return (uint32_t)hi.free_blocks;
+}
+
+// 哪些算「异常复位」（计入 crashCount）。
+//   ★ PWR_GLITCH / CPU_LOCKUP 必须计入：前者是芯片的电源毛刺检测电路触发的
+//     （插拔 Type-C 那一瞬间的电压突变最容易命中），后者是双重异常把 CPU 锁死，
+//     两者都是真故障。原来漏了它们，故障会被静默计成"正常"。
+//   ★ USB / JTAG 不计入：那是把板子插到电脑上时，主机枚举 USB-Serial-JTAG 并
+//     toggle DTR/RTS 触发的复位（S3 内置的自动下载电路），属于正常开发操作，
+//     算进 crashCount 只会把调试噪声混进故障统计。
+static bool healthIsCrash(uint32_t r) {
+    return r == ESP_RST_PANIC      || r == ESP_RST_INT_WDT  || r == ESP_RST_TASK_WDT ||
+           r == ESP_RST_WDT        || r == ESP_RST_BROWNOUT ||
+           r == ESP_RST_PWR_GLITCH || r == ESP_RST_CPU_LOCKUP;
+}
+// ★ 必须覆盖 esp_reset_reason_t 的全部取值：漏掉的一律落到 "未知"，
+//   而"未知"对排查毫无帮助 —— 实测就吃过亏：插 Type-C 复位查不出原因，
+//   正是因为 PWR_GLITCH / USB 这两种没列出来，全被归进了"未知"。
+static const char* healthResetName(uint32_t r) {
+    switch (r) {
+        case ESP_RST_POWERON:    return "上电";
+        case ESP_RST_EXT:        return "外部复位脚";
+        case ESP_RST_SW:         return "软复位";
+        case ESP_RST_PANIC:      return "崩溃(panic)";
+        case ESP_RST_INT_WDT:    return "中断看门狗";
+        case ESP_RST_TASK_WDT:   return "任务看门狗";
+        case ESP_RST_WDT:        return "其它看门狗";
+        case ESP_RST_DEEPSLEEP:  return "深睡唤醒";
+        case ESP_RST_BROWNOUT:   return "欠压";
+        case ESP_RST_SDIO:       return "SDIO";
+        case ESP_RST_USB:        return "USB外设复位";   // 插电脑时主机 DTR/RTS 触发，正常
+        case ESP_RST_JTAG:       return "JTAG";
+        case ESP_RST_EFUSE:      return "eFuse错误";
+        case ESP_RST_PWR_GLITCH: return "电源毛刺";       // 插拔电源瞬间的电压突变
+        case ESP_RST_CPU_LOCKUP: return "CPU死锁";        // 双重异常
+        default:                 return "未知";
+    }
+}
+
+// setup() 里尽早调用（在关机休眠判定之后、外设初始化之前）
+static void healthBoxInit() {
+    uint32_t reason = esp_reset_reason();
+    if (g_hb.magic != HEALTH_MAGIC) {          // 首次上电 / 结构变更 → 全新初始化
+        memset(&g_hb, 0, sizeof(g_hb));
+        g_hb.magic         = HEALTH_MAGIC;
+        g_hb.minFreeHeap   = 0xFFFFFFFFu;
+        g_hb.minLargestBlk = 0xFFFFFFFFu;
+        g_hb.minFreePsram  = 0xFFFFFFFFu;
+        g_hb.minPsramBlk   = 0xFFFFFFFFu;
+        for (int i = 0; i < 6; i++) g_hb.stkMinFree[i] = 0xFFFF;
+    }
+    // ★ 转存启动阶段：此刻 curStage 还是【上次停下时】的值（RTC 不被复位清除），
+    //   必须在本次 setup 打第一个点之前取走，否则就被覆盖了。
+    g_hb.lastStage = g_hb.curStage;
+    g_hb.curStage  = BS_NONE;
+    // 同理转存"上次撑了多久"（本次的第一次 healthBoxSample 还没跑，此刻它仍是上次的值）
+    g_hb.prevUptimeSec = g_hb.lastUptimeSec;
+    // 运行期阶段清零：上次的值已由 wdtStage 冻在快照里，这里不该残留干扰本次判断
+    for (int i = 0; i < HT_SLOTS; i++) g_hb.taskStage[i] = 0;
+
+    g_hb.bootCount++;
+    g_hb.lastReset = reason;
+    if (healthIsCrash(reason)) g_hb.crashCount++;
+    LOG("[HB] 第 %u 次启动 | 本次复位=%s | 累计异常复位=%u | 上次运行=%us(最长 %us)\n",
+        (unsigned)g_hb.bootCount, healthResetName(reason),
+        (unsigned)g_hb.crashCount, (unsigned)g_hb.lastUptimeSec, (unsigned)g_hb.maxUptimeSec);
+    // ★ 这一行才是启动期崩溃的现场：告诉你上次停在哪一步，不需要串口。
+    //   lastStage < BS_RUNNING = 上次没跑完 setup（启动期崩溃）；
+    //   == BS_RUNNING = 崩在运行期；== BS_SHUTDOWN = 正常关机，不是故障。
+    if (healthIsCrash(reason) || g_hb.lastStage != BS_RUNNING) {
+        LOG("[HB] ★ 上次停在: %s (stage=%u)%s\n",
+            healthStageName(g_hb.lastStage), (unsigned)g_hb.lastStage,
+            (g_hb.lastStage != BS_RUNNING && g_hb.lastStage != BS_SHUTDOWN &&
+             g_hb.lastStage != BS_NONE) ? "  ← 启动期崩溃！" : "");
+    }
+}
+
+// 资源监控里每 5s 调用：把当前值并入历史最差值
+static void healthBoxSample() {
+    uint32_t up = millis() / 1000;
+    g_hb.lastUptimeSec = up;                       // 崩溃后这就是"撑了多久"
+    if (up > g_hb.maxUptimeSec) g_hb.maxUptimeSec = up;
+
+    size_t v;
+    size_t iFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (iFree < g_hb.minFreeHeap)   g_hb.minFreeHeap   = iFree;
+    size_t iBlk  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    if (iBlk < g_hb.minLargestBlk)  g_hb.minLargestBlk = iBlk;
+
+    // ★ 低水位快照：只在【首次】跌破阈值时抓，记的是"第一次出事时系统在干什么"。
+    //   原来只有 minLargestBlk 一个孤立数字 —— 看得到曾经跌到 1908B，却不知道何时跌的、
+    //   当时哪个任务在做什么，等于知道有病却查不出病灶。
+    //   不重复抓：第一次跌破往往就是根因现场，后面的多是被它拖出来的连锁反应。
+    if (iBlk < HEALTH_LOWBLK_WARN && g_hb.lowBlkAt == 0) {
+        g_hb.lowBlkAt   = up ? up : 1;    // 0 有"从未发生"的语义，故最小记 1
+        g_hb.lowBlkBoot = g_hb.bootCount;
+        g_hb.lowBlkVal  = iBlk;
+        g_hb.lowBlkHeap = iFree;
+        for (int i = 0; i < HT_SLOTS; i++) g_hb.lowBlkStage[i] = g_hb.taskStage[i];
+        LOG("[HB] ⚠⚠ 内部RAM 最大连续块跌破 %uKB（现 %u B，空闲堆 %u B）→ 已抓低水位快照\n",
+            (unsigned)(HEALTH_LOWBLK_WARN / 1024), (unsigned)iBlk, (unsigned)iFree);
+    }
+
+    v = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (v < g_hb.minFreePsram)  g_hb.minFreePsram  = v;
+    v = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+    if (v < g_hb.minPsramBlk)   g_hb.minPsramBlk   = v;
+
+    TaskHandle_t hs[6] = { xTaskGetCurrentTaskHandle(), xImuTaskHandle, xWebTaskHandle,
+                           xLcdTaskHandle, xAudTaskHandle, xMicTaskHandle };
+    for (int i = 0; i < 6; i++) {
+        if (!hs[i]) continue;
+        uint32_t f = uxTaskGetStackHighWaterMark(hs[i]) * sizeof(StackType_t);
+        if (f > 0xFFFF) f = 0xFFFF;
+        if (f < g_hb.stkMinFree[i]) g_hb.stkMinFree[i] = (uint16_t)f;
+    }
+    g_hb.selfHealHits = g_selfHealHits;
+}
+
+// 供 web.cpp 组 MQTT 上报用。键名短，一条 MQTT 消息装得下。
+// 语义：boot/crash/reset/up/maxUp 是跨重启累积；min* 是历史最差值；stk 是各任务栈历史最小剩余。
+void healthBoxJson(char* out, size_t n) {
+    snprintf(out, n,
+        "{\"boot\":%u,\"crash\":%u,\"reset\":\"%s\","
+        // ★ stage 紧跟 reset：这两个字段合起来才是完整现场（"为什么复位" + "停在哪"）。
+        //   放最前面也是防截断——万一将来字段加多了超出缓冲，先保住的是诊断价值最高的。
+        "\"stage\":%u,\"stageAt\":\"%s\","
+        // ★ TWDT 现场：wdt=累计触发次数，wdtTs=超时【那一刻】各任务卡在哪一步
+        //   （下标 web/lcd/imu/mic/persist，码值见 health.hpp）。
+        //   reset="任务看门狗" 时先看这个数组，直接指认是谁没喂狗、卡在哪。
+        "\"wdt\":%u,\"wdtTs\":[%u,%u,%u,%u,%u],"
+        // lastUp = 上次【崩溃前撑了多久】。几分钟 vs 十几小时是完全不同的故障模式，
+        // 原来结构里存了却没上报，等于白记。
+        "\"up\":%u,\"lastUp\":%u,\"maxUp\":%u,"
+        "\"heapNow\":%u,\"heapMin\":%u,\"blkNow\":%u,\"blkMin\":%u,"
+        // ★ 低水位快照：at=发生时刻(uptime 秒，0=从未发生)，blk/heap=当时的值，
+        //   ts=当时各任务在干什么。回答"内存是什么时候、被谁吃掉的"。
+        "\"lowBlk\":{\"boot\":%u,\"at\":%u,\"blk\":%u,\"heap\":%u,\"ts\":[%u,%u,%u,%u,%u]},"
+        "\"psMin\":%u,\"psBlkMin\":%u,\"heal\":%u,"
+        "\"blkN\":%u,\"fsUsed\":%u,\"fsTotal\":%u,"
+        "\"net\":{\"up\":%d,\"noRx\":%u,\"fail\":%u,\"err\":%d,\"failBlk\":%u,"
+        "\"recov\":%u,\"reboot\":%u},\"sprFail\":%u,"
+        "\"stk\":[%u,%u,%u,%u,%u,%u]}",
+        (unsigned)g_hb.bootCount, (unsigned)g_hb.crashCount,
+        healthResetName(g_hb.lastReset),
+        (unsigned)g_hb.lastStage, healthStageName(g_hb.lastStage),
+        (unsigned)g_hb.wdtCount,
+        g_hb.wdtStage[0], g_hb.wdtStage[1], g_hb.wdtStage[2],
+        g_hb.wdtStage[3], g_hb.wdtStage[4],
+        (unsigned)(millis() / 1000), (unsigned)g_hb.prevUptimeSec,
+        (unsigned)g_hb.maxUptimeSec,
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)g_hb.minFreeHeap,
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+        (unsigned)g_hb.minLargestBlk,
+        (unsigned)g_hb.lowBlkBoot, (unsigned)g_hb.lowBlkAt,
+        (unsigned)g_hb.lowBlkVal, (unsigned)g_hb.lowBlkHeap,
+        g_hb.lowBlkStage[0], g_hb.lowBlkStage[1], g_hb.lowBlkStage[2],
+        g_hb.lowBlkStage[3], g_hb.lowBlkStage[4],
+        (unsigned)g_hb.minFreePsram, (unsigned)g_hb.minPsramBlk,
+        (unsigned)g_hb.selfHealHits,
+        // ★ blkN = 内部 RAM 的空闲块【数量】—— 比"碎片率"更能说明问题：
+        //   3 块平均 20KB = 健康；80 块平均 750B = 严重碎片（剩余总量可能一样）。
+        (unsigned)healthFreeBlocks(),
+        // LittleFS 用量：语音(最多10条×240KB)+下载的视频/音频都写在这里。
+        // 剩余空间不足时 LittleFS 写入会急剧变慢甚至失败，而写 flash 会冻结 core0 cache。
+        (unsigned)LittleFS.usedBytes(), (unsigned)LittleFS.totalBytes(),
+        // ── 网络诊断 ──
+        //   noRx 几百秒 = 设备根本没收到东西（网络断了）；只有几秒 = 网络正常，问题在别处。
+        //   err=-2 且 failBlk 很小 = TLS 握手时内存不够；err=4/5 = 认证/ACL，与内存无关。
+        (int)(WiFi.status() == WL_CONNECTED),
+        (unsigned)(g_lastAnyRxMs ? (millis() - g_lastAnyRxMs) / 1000 : 9999),
+        (unsigned)g_mqttFailCnt, (int)g_mqttLastErr, (unsigned)g_mqttFailBlk,
+        (unsigned)g_netRecoverCnt, (unsigned)g_netRebootCnt,
+        (unsigned)g_sprFail,
+        g_hb.stkMinFree[0], g_hb.stkMinFree[1], g_hb.stkMinFree[2],
+        g_hb.stkMinFree[3], g_hb.stkMinFree[4], g_hb.stkMinFree[5]);
+}
+
 // 等 Button1 松开（arm 唤醒前调用）：触发关机/校验失败时按钮仍被按住(LOW)，
 // 不等松手就 arm 低电平唤醒会立即再次自唤醒。
 // ★ 要求"持续高电平 150ms"才算真松开：只看一次高电平就 arm 的话，机械抖动的下一个
@@ -619,6 +987,11 @@ static void enterShutdown()
 {
     LOG("[PWR] ★ 进入关机（长按 8s 或低电触发）→ 置标志 + 硬复位\n");
 
+    // ★ 标记"这是正常关机"：否则下次开机会看到 lastStage=运行期 + reset=软复位，
+    //   与真实故障混在一起。关机休眠期间 healthBoxInit 不执行（runShutdownSleep 不返回），
+    //   所以这个值会一直保留到用户单击开机后的那次 setup 才被读走。
+    healthSetStage(BS_SHUTDOWN);
+
     // ★ 先把延后的落盘写完（可能还有刚收到的视频只在 PSRAM 里，复位会丢）。
     persistFlushBlocking(15000);
 
@@ -669,6 +1042,15 @@ void setup() {
     }
     s_shutdownFlag = 0;       // 正常启动路径也清掉，避免残留误判
 
+    // ★ 健康黑匣子：必须在这里初始化（关机休眠判定之后、外设初始化之前），
+    //   这样"上次为什么挂的"在任何可能再次崩溃的代码跑起来之前就已经记下。
+    healthBoxInit();
+
+    // ★ OTA：若 NVS 标记要求升级 → 进入纯净下载环境（不返回，内部 esp_restart）；
+    //   或处理"新固件启动失败被回滚"的残留。放在任何常规外设初始化【之前】——
+    //   OTA 环境只用 NVS/WiFi/LCD(轻量进度屏)/HTTPS，内存最宽裕、无 flash/PM/看门狗冲突。
+    otaBootCheck();
+
     // ★ 尽早压灭背光：从上电到 LCD 首帧画好之前保持全灭。否则 GPIO17 上电浮空可能微亮、
     //   且 lcdInit 的 tft.init() 一结束就点亮背光，而那时面板刚复位、8 个视频还没预加载完，
     //   显示的是花屏——这是开机"闪几遍"的根因之一。背光由 lcdTask 开机进度条从黑渐亮起来。
@@ -681,6 +1063,7 @@ void setup() {
     LOG("[BOOT] PSRAM剩余:   %u KB\n", ESP.getFreePsram() / 1024);
 
     /* Flash 文件系统初始化 */
+    healthSetStage(BS_FS);
     LOG("[BOOT] (1/9) 挂载 LittleFS...\n");
     if (!fsInit()) {
         LOG("[BOOT] ✗ LittleFS 挂载失败，系统停止启动！\n");
@@ -689,6 +1072,7 @@ void setup() {
     LOG("[BOOT] ✓ LittleFS 就绪\n");
 
     /* SN 校验 */
+    healthSetStage(BS_SN);
     LOG("[BOOT] (2/9) SN 序列号校验...\n");
     if (!snSetup()) {
         LOG("[BOOT] ✗ SN 校验失败，系统停止启动！\n");
@@ -697,6 +1081,7 @@ void setup() {
     LOG("[BOOT] ✓ SN 校验通过\n");
 
     /* 电源管理 / 自动 light-sleep */
+    healthSetStage(BS_PM);
     LOG("[BOOT] (3/9) 配置电源管理（自动 light-sleep）...\n");
     {
         esp_pm_config_t pm = { .max_freq_mhz = 240, .min_freq_mhz = 40, .light_sleep_enable = true };
@@ -707,10 +1092,25 @@ void setup() {
             // 抬频锁:持有=锁定到 max_freq(240)；释放=系统自动降到 40 并可 light-sleep
             esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "freqmax", &s_freqLock);
             esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "nosleep", &s_sleepLock);   // 信封态禁睡用
+
+            // ★★ 启动期全程持锁（满频 + 禁 light-sleep）——修"开机转圈背光闪"。
+            //   背光是 LovyanGFX 的 Light_PWM，走 LEDC、44.1kHz、时钟源 APB。
+            //   light-sleep 一进 APB 就停，PWM 输出随之停摆，唤醒后再恢复 → 肉眼可见的闪。
+            //   而 powerManagerLoop 要到 loop() 首轮才跑，【本行到 setup 结束是一段
+            //   没有任何人持锁的真空期】，偏偏这段的空闲窗口极密集：bootSpinnerTask 每帧
+            //   vTaskDelay(30ms)、预加载每 32KB 让出一次、audInit 还有两个 delay(200)，
+            //   几乎每帧都能睡进去，于是整个转圈过程一直在闪。
+            //   （同一个坑在 runShutdownSleep 显示低电图标前已经处理过一次：那里是直接
+            //     esp_pm_configure 关掉 light-sleep，注释写的就是"否则背光 PWM 停"。）
+            //   ★ 衔接：进 loop 后 powerManagerLoop 的 L0 分支会 setSleepLock(false)
+            //     把它放掉，稳态功耗与改动前完全一致；此处只覆盖启动这十几秒。
+            cpuBoost(true);
+            setSleepLock(true);
         }
     }
 
     /* 配置 + BLE */
+    healthSetStage(BS_CFG_BLE);
     LOG("[BOOT] (4/9) 加载配置 + 初始化 BLE...\n");
     // 先读 SN，用它拼出唯一 BLE 名 EGG_<SN>（修"所有设备同名、App 分不清"的 Bug）。
     // ★ 静态缓冲：Config.begin 只存名字指针供后续 BLE 初始化用，不能传临时 String。
@@ -728,11 +1128,13 @@ void setup() {
     LOG("[BOOT] ✓ 配置就绪\n");
 
     /* LCD */
+    healthSetStage(BS_LCD_INIT);   // lcdInit 内部会把预加载细分到 BS_LCD_PRELOAD+slot
     LOG("[BOOT] (5/9) 初始化 LCD...\n");
     lcdInit();
     LOG("[BOOT] ✓ LCD 就绪\n");
 
     /* 音频 */
+    healthSetStage(BS_AUD);
     LOG("[BOOT] (6/9) 初始化音频（I2S/MAX98357A 功放）...\n");
     if (audInit() != AUD_OK) {
         LOG("[BOOT] ⚠ 音频初始化异常（继续启动，播放可能不可用）\n");
@@ -741,6 +1143,7 @@ void setup() {
     }
 
     /* 麦克风（PDM，I2S0；Button1 单击录音）*/
+    healthSetStage(BS_MIC);
     LOG("[BOOT] 初始化麦克风（PDM，I2S0）...\n");
     if (!initMIC()) {
         LOG("[BOOT] ⚠ 麦克风初始化失败（继续启动，录音功能不可用）\n");
@@ -749,17 +1152,20 @@ void setup() {
     }
 
     /* IMU */
+    healthSetStage(BS_IMU);
     LOG("[BOOT] (7/9) 初始化 IMU（QMI8658）...\n");
     imuInit();
     LOG("[BOOT] ✓ IMU 就绪\n");
 
     /* 舵机 */
+    healthSetStage(BS_SERVO);
     LOG("[BOOT] (8/9) 初始化舵机...\n");
     servoInit();
     servoRotate(SERVO_REST_ANGLE);
     LOG("[BOOT] ✓ 舵机就绪（归中位 %d°）\n", SERVO_REST_ANGLE);
 
     /* 电量 ADC */
+    healthSetStage(BS_BAT);
     LOG("[BOOT] (9/9) 初始化电量检测...\n");
     batInit();
     LOG("[BOOT] ✓ 电量检测就绪\n");
@@ -769,12 +1175,12 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(PROV_BUTTON_PIN), buttonISR, FALLING);
 
     /* 消息队列 */
+    healthSetStage(BS_QUEUE);
     LOG("[BOOT] 创建消息队列...\n");
     qMainToLcd    = xQueueCreate(5, sizeof(MessageToLCD_t));
     qMainToWeb    = xQueueCreate(5, WEB_MSG_LEN);
     qMainToAud    = xQueueCreate(5, sizeof(MessageToAud_t));
     qMainToMic    = xQueueCreate(5, sizeof(MessageToMic_t));
-    qLcdToMain    = xQueueCreate(5, sizeof(MessageToMain_t));
     qWebToMain    = xQueueCreate(5, sizeof(MessageToMain_t));
     qImuToMain    = xQueueCreate(5, sizeof(MessageToMain_t));
     qConfigUpdate = xQueueCreate(3, sizeof(uint8_t));
@@ -786,7 +1192,7 @@ void setup() {
     xLcdWake  = xSemaphoreCreateBinary();
     xAudWake  = xSemaphoreCreateBinary();
     if (!qMainToLcd || !qMainToWeb || !qMainToAud || !qMainToMic ||
-        !qLcdToMain || !qWebToMain || !qServoCmd || !qImuToMain || !qConfigUpdate ||
+        !qWebToMain || !qServoCmd || !qImuToMain || !qConfigUpdate ||
         !qPosStream || !xMainWake || !xLcdWake || !xAudWake) {
         LOG("[BOOT] ✗ 队列/信号量创建失败！\n");
         while (true) {}
@@ -794,6 +1200,7 @@ void setup() {
     LOG("[BOOT] ✓ 队列 + 唤醒信号量就绪\n");
 
     /* 任务创建 */
+    healthSetStage(BS_TASKS);
     LOG("[BOOT] 创建任务...\n");
 
     // 交接屏幕所有权：停"开机转圈"并等它退出，之后再建 lcdTask 接管 tft（杜绝双写屏幕）。
@@ -848,6 +1255,14 @@ void setup() {
 
     LOG("[BOOT] ════════ 系统初始化完成 ════════\n\n");
 
+    // ★ setup 全部走完 → 标记进入运行期。此后再崩，lastStage 就是 BS_RUNNING，
+    //   一眼区分"启动期崩溃"（stage < 99，本次事故的形态）和"运行期崩溃"。
+    healthSetStage(BS_RUNNING);
+
+    // ★ OTA 自检：本次若是新固件首次启动(VERIFYING)，跑到运行期 = 启动成功 →
+    //   esp_ota_mark_app_valid_cancel_rollback()，确认新固件、取消 bootloader 回滚。
+    otaMarkValidOnBoot();
+
     g_lastActivityMs = millis();   // 开机视为活动，避免立即进省电
 }
 
@@ -871,6 +1286,14 @@ static void processServoCmd(const char* strVal)
             servoRotate(angle);
         }
     }
+    // ★ 首拍保留：本次若把舵机从断电态唤醒（servoJustPoweredOn）且是摆动指令，
+    //   开一个保留窗，让这一拍走完再接受下一条 —— 否则紧随其后的回中位会把它
+    //   顶掉，用户看不到动作。回中位本身不开窗（它就是要回去的）。
+    if (parsedCount >= 1 && angle != SERVO_REST_ANGLE && servoJustPoweredOn) {
+        g_servoSwingHoldUntil = millis() + SERVO_FIRST_SWING_HOLD_MS;
+        LOG("[SERVO] 舵机刚上电 → 首拍保留 %dms\n", SERVO_FIRST_SWING_HOLD_MS);
+    }
+
     // ★ 物理摇摆(舵机偏离中位)时同步播"摇一摇"动画。App 摇摆控件发的就是 SERVO52/122。
     //   回中位 87 = 静止，不触发。此路径也覆盖 P3 伙伴镜像摇摆。
     //   NONINT + !lcdIsPlaying() 守卫：正在播摇摆时忽略后续摇摆、既不打断也不重播。
@@ -942,18 +1365,47 @@ void loop() {
     // ── 舵机指令：独立深度1覆盖队列(qServoCmd)。连发 SERVO 只应用最新角度，
     //   不占 qWebToMain(不会挤掉/排在播放指令后)，深度1覆盖也不会因满而丢。──
     {
-        MessageToMain_t servoCmd;
-        if (xQueueReceive(qServoCmd, &servoCmd, 0) == pdTRUE)
-            processServoCmd(servoCmd.strVal);
+        // ★ 首拍保留窗内不取新指令：让刚上电的舵机把这一拍走完。
+        //   窗内到达的指令仍在 qServoCmd 里覆盖累积（深度1，留最新一条），
+        //   窗口结束后照常取走——与原语义一致，只是晚一小段。
+        //   用有符号差值比较，millis() 溢出时也不会误判。
+        bool holding = (g_servoSwingHoldUntil != 0) &&
+                       ((int32_t)(millis() - g_servoSwingHoldUntil) < 0);
+        if (!holding) {
+            g_servoSwingHoldUntil = 0;        // 窗口到期（或本就没开），恢复常规节奏
+            MessageToMain_t servoCmd;
+            if (xQueueReceive(qServoCmd, &servoCmd, 0) == pdTRUE)
+                processServoCmd(servoCmd.strVal);
+        }
     }
 
+
     // ── Web 指令处理 ─────────────────────────────────────
-    if (xQueueReceive(qWebToMain, &msgFromWeb, 0) == pdTRUE) {
+    //  ★ 每轮排空至多 QWEB_DRAIN_PER_LOOP 条（原来每轮只取 1 条）。
+    //    qWebToMain 深度只有 5，而所有生产者都用超时 0（满了静默丢弃）。主循环一旦被
+    //    某条消息的阻塞处理拖住（WBL 分支里 servoRotateAV 是逐度 delay 的，可达数秒），
+    //    队列就会积压 → 后续消息被丢。丢到 XFER_UNLOCK 就是永久锁死：xferLocked 恒为真
+    //    → forceActive 永不休眠(电流从 2.2mA 涨到几十 mA) + VIDEO_SHOW/RECORD/SERVO
+    //    全被"传输中，屏蔽"，且只能重启恢复。
+    //    上限而不是全排空：单条消息可能阻塞很久，一次处理太多会让本轮 loop 过长，
+    //    影响按键/电量/功耗状态机的响应。
+    //  ★ 同时设时间预算：本循环里有【阻塞式】分支（WBL 的 servoRotateAV 是逐度 delay，
+    //    可达数秒）。只按条数排空的话，连着 4 条 WBL 会把主循环一口气堵住十几秒，
+    //    期间不检查按键（含 8 秒长按关机！）、不采电量、不跑功耗状态机。
+    //    时间检查放在【每次取消息之前】：处理完一条耗时的就立刻收手、让本轮 loop 走完，
+    //    剩下的下一轮再排 —— 既排得快，又不牺牲响应性。
+    uint32_t drainT0 = millis();
+    for (int drained = 0;
+         drained < QWEB_DRAIN_PER_LOOP &&
+         (millis() - drainT0) < QWEB_DRAIN_BUDGET_MS &&
+         xQueueReceive(qWebToMain, &msgFromWeb, 0) == pdTRUE;
+         drained++) {
         LOG("[Main] 收到Web指令: %s\n", msgFromWeb.strVal);
 
         // ── 传输锁定 ──
         if (strcmp(msgFromWeb.strVal, "XFER_LOCK") == 0) {
-            xferLocked = true;
+            // 锁状态本身由 g_xfering 直接反映，这里只负责【副作用】：停音频 + LCD 切待机。
+            // 所以这条消息即便丢了也不会让设备锁死，最多是没及时停播。
             LOG("[Main] ★ 传输锁定：停止视频和音频播放\n");
 
             // 停止音频
@@ -969,7 +1421,7 @@ void loop() {
         }
         // ── 传输解锁 ──
         else if (strcmp(msgFromWeb.strVal, "XFER_UNLOCK") == 0) {
-            xferLocked = false;
+            // 解锁已随 g_xfering 自动生效（就算这条消息丢了也不会锁死），此处仅留日志标记
             LOG("[Main] ★ 传输解锁：恢复正常\n");
         }
         // ── 视频 & 音频播放 ──
@@ -1123,12 +1575,37 @@ void loop() {
     if (currentTime - lastMonitorTime >= RESOURCE_MONITOR_INTERVAL_MS) {
         lastMonitorTime = currentTime;
 
+        // ★ 先并入黑匣子（RTC 内存，跨崩溃保留），再打日志。
+        //   串口在 light-sleep 后就断了，真正能带出现场的是这一行不是下面的 LOG。
+        healthBoxSample();
+
         LOG("\n==================== 系统资源监控 ====================\n");
         LOG("运行时间: %lu 秒 | 传输锁: %s\n",
             currentTime / 1000, xferLocked ? "锁定" : "正常");
         LOG("------------------------------------------------------\n");
         LOG("堆内存: 剩余=%lu 字节 | 历史最小=%lu 字节\n",
             ESP.getFreeHeap(), ESP.getMinFreeHeap());
+
+        // ★ 碎片化指标：只看"剩余总量"看不出碎片化 —— 剩余可能还有 100KB，但最大连续块
+        //   已经掉到 8KB，此时任何一次 16KB+ 的分配（I2S DMA / MQTT 缓冲 / JPEG 解码 /
+        //   PSRAM 快照）都会失败 → 表现为"长时间运行后功能异常"，而堆监控一切正常。
+        //   碎片率 = 1 - 最大块/剩余总量。持续上升就是碎片化在恶化。
+        {
+            size_t iFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            size_t iBig  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+            size_t pFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            size_t pBig  = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+            LOG("碎片化: 内部RAM 剩余=%uKB 最大块=%uKB 碎片率=%u%% | "
+                "PSRAM 剩余=%uKB 最大块=%uKB 碎片率=%u%%\n",
+                (unsigned)(iFree / 1024), (unsigned)(iBig / 1024),
+                (unsigned)(iFree ? 100 - (uint32_t)((uint64_t)iBig * 100 / iFree) : 0),
+                (unsigned)(pFree / 1024), (unsigned)(pBig / 1024),
+                (unsigned)(pFree ? 100 - (uint32_t)((uint64_t)pBig * 100 / pFree) : 0));
+            // 最大块跌破这个线就该警觉：I2S DMA 环(16KB)、MQTT 缓冲(8KB)都在这个量级
+            if (iBig < 20 * 1024)
+                LOG("⚠⚠ 内部RAM 最大连续块仅 %uKB —— 大块分配即将开始失败（碎片化）\n",
+                    (unsigned)(iBig / 1024));
+        }
         // ★ 原来这里另算了一份"主任务栈"，按 TASK_STACK_SIZE(16384) 折算 → 73.6%，
         //   而下面 printStackHWM("loopTask", 8192) 同一时刻算出 47.3%：同一个任务两个数字，
         //   且 16384 是错的（Arduino loopTask 默认 8192）。删掉重复实现，统一走 printStackHWM。
@@ -1162,5 +1639,11 @@ void loop() {
     // ── 心跳调度：L2 阻塞等事件（喂 light-sleep），事件 give 信号量瞬时唤醒；
     //    L0/L1 维持 100ms（按键长按检测/巡检）。──
     uint32_t napMs = (g_pwrTier == 2) ? PWR_L2_BLOCK_MS : 100;
+    // ★ 首拍保留窗内：只睡到窗口到期，别多睡。否则窗口结束后还要再等一整轮
+    //   轮询(100ms)才去取那条积压的回中位，回中位会明显拖慢。
+    if (g_servoSwingHoldUntil) {
+        int32_t left = (int32_t)(g_servoSwingHoldUntil - millis());
+        if (left > 0 && (uint32_t)left < napMs) napMs = (uint32_t)left;
+    }
     xSemaphoreTake(xMainWake, pdMS_TO_TICKS(napMs));
 }

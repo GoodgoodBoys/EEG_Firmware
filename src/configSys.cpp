@@ -1,6 +1,19 @@
 #include "inc/configSys.hpp"
 #include "esp_random.h"
 #include "inc/debug.hpp"
+#include <Preferences.h>
+
+// ============================================================
+//  配置持久化：存 NVS（不是 LittleFS）
+//  · 独立命名空间 "egg_cfg"（与 SN 的 "device_info" 分开）。
+//  · 整份配置以一个 JSON blob 存一个键：一次 save = 一次 putString，写入量最小、最省磨损。
+//  · NVS 分区(0x9000, 20KB)不随 `uploadfs` / 文件系统 OTA 重刷而丢 —— 配置(含 peerSn 互绑、
+//    WiFi 凭据、matchCode)从此持久，只有显式 `erase` 才清（与 SN 同级保护）。
+//  · 旧固件把配置存在 LittleFS /Config/config.json；首次跑新固件时 migrateLegacyFromLittleFS()
+//    自动搬进 NVS，现有设备升级不丢配置。
+// ============================================================
+#define CFG_NVS_NS   "egg_cfg"
+#define CFG_NVS_KEY  "blob"
 
 // ============================================================
 // BLE 服务端连接回调
@@ -61,31 +74,21 @@ ConfigManager::ConfigManager() {}
 bool ConfigManager::begin(const char* bleName) {
     LOG("[CFG] 初始化配置管理器...\n");
 
+    // LittleFS 仍需挂载：视频/语音/target 存这里；旧配置迁移也从这里读。
     if (!mountFS()) return false;
 
-    bool mainOk   = validateJson(CONFIG_FILE);
-    bool backupOk = validateJson(CONFIG_BACKUP_FILE);
-
-    if (mainOk) {
-        loadFromFile(CONFIG_FILE);
-        LOG("[CFG] 主配置加载成功\n");
-        if (!backupOk) {
-            String js = toJsonString();
-            writeFile(CONFIG_BACKUP_FILE, js);
-            LOG("[CFG] 备份已刷新\n");
-        }
-    } else if (backupOk) {
-        LOG("[CFG] 主配置损坏，尝试从备份恢复...\n");
-        if (restoreFromBackup()) LOG("[CFG] 从备份恢复成功\n");
-        else { LOG("[CFG] 备份恢复失败，初始化默认配置\n"); initDefaultConfig(); save(); }
+    if (loadFromNvs()) {
+        LOG("[CFG] ✓ 从 NVS 加载配置\n");
+    } else if (migrateLegacyFromLittleFS()) {
+        LOG("[CFG] ✓ 检测到旧 LittleFS 配置 → 已迁移进 NVS\n");
     } else {
-        LOG("[CFG] 首次开机，初始化默认配置...\n");
+        LOG("[CFG] 首次开机（NVS 无配置、无旧文件），初始化默认配置...\n");
         initDefaultConfig();
         save();
     }
 
     _bleName = bleName;   // 记录名字，配网时再懒加载 BLE
-    LOG("[CFG] 初始化完成（BLE 延迟到配网时初始化）\n");
+    LOG("[CFG] 初始化完成（配置存 NVS；BLE 延迟到配网时初始化）\n");
     return true;
 }
 
@@ -135,34 +138,35 @@ void ConfigManager::initDefaultConfig() {
     LOG("[CFG] 默认配置已初始化（matchCode=%s）\n", mc);
 }
 
-bool ConfigManager::atomicWrite(const String& jsonStr) {
-    if (!writeFile(CONFIG_TEMP_FILE, jsonStr)) { LOG("[CFG] 写入临时文件失败\n"); return false; }
-    if (!validateJson(CONFIG_TEMP_FILE)) {
-        LOG("[CFG] 临时文件校验失败，中止写入\n");
-        LittleFS.remove(CONFIG_TEMP_FILE);
+// 从 NVS 读整份配置 JSON blob 进 _doc。命名空间/键不存在或解析失败返回 false。
+// ★ 在 begin() 里调用，此时任务尚未创建（单线程），故 deserialize 无需加锁（同 loadFromFile）。
+bool ConfigManager::loadFromNvs() {
+    Preferences p;
+    if (!p.begin(CFG_NVS_NS, true)) return false;   // 只读；命名空间不存在 → false（首次开机）
+    String js = p.getString(CFG_NVS_KEY, "");
+    p.end();
+    if (js.isEmpty()) return false;
+    DeserializationError err = deserializeJson(_doc, js);
+    if (err) { LOG("[CFG] NVS 配置解析失败: %s\n", err.c_str()); return false; }
+    // 最小字段校验：缺关键字段视为无效 → 回退到迁移/默认（防写坏的残留）
+    if (!_doc.containsKey("ssid") || !_doc.containsKey("matchCode")) {
+        LOG("[CFG] NVS 配置缺关键字段，判为无效\n");
         return false;
     }
-    if (LittleFS.exists(CONFIG_FILE)) {
-        if (LittleFS.exists(CONFIG_BACKUP_FILE)) LittleFS.remove(CONFIG_BACKUP_FILE);
-        if (!LittleFS.rename(CONFIG_FILE, CONFIG_BACKUP_FILE))
-            LOG("[CFG] 备份旧配置失败，继续尝试覆盖...\n");
-    }
-    if (!writeFile(CONFIG_FILE, jsonStr)) {
-        LOG("[CFG] 写入正式配置文件失败！\n");
-        restoreFromBackup();
-        return false;
-    }
-    LittleFS.remove(CONFIG_TEMP_FILE);
-    LOG("[CFG] 配置已原子写入\n");
     return true;
 }
 
-bool ConfigManager::restoreFromBackup() {
-    if (!validateJson(CONFIG_BACKUP_FILE)) { LOG("[CFG] 备份文件无效，无法恢复\n"); return false; }
-    String content = readFile(CONFIG_BACKUP_FILE);
-    if (content.isEmpty()) return false;
-    if (!writeFile(CONFIG_FILE, content)) { LOG("[CFG] 恢复备份到主配置失败\n"); return false; }
-    return loadFromFile(CONFIG_FILE);
+// 一次性迁移：旧固件把配置存在 LittleFS /Config/config.json。首次跑新固件（NVS 尚无配置）时
+// 把它读出来并 save() 进 NVS，现有设备升级不丢 WiFi/matchCode/互绑。之后 NVS 优先，不再触发。
+// 旧文件保留不删（无害；万一回退旧固件仍能读到）。
+bool ConfigManager::migrateLegacyFromLittleFS() {
+    bool ok = false;
+    if (validateJson(CONFIG_FILE)        && loadFromFile(CONFIG_FILE))        ok = true;
+    else if (validateJson(CONFIG_BACKUP_FILE) && loadFromFile(CONFIG_BACKUP_FILE)) ok = true;
+    if (!ok) return false;
+    if (!save()) { LOG("[CFG] ⚠ 旧配置迁移写 NVS 失败\n"); return false; }
+    LOG("[CFG] 旧配置已迁移进 NVS：%s\n", toJsonString().c_str());
+    return true;
 }
 
 bool ConfigManager::save() {
@@ -171,9 +175,36 @@ bool ConfigManager::save() {
     _doc.garbageCollect();
     taskEXIT_CRITICAL(&_mux);
 
-    String js = toJsonString();
+    String js = toJsonString();   // 内部持锁，序列化进栈缓冲后在临界区外构造 String
     if (js.isEmpty()) return false;
-    return atomicWrite(js);
+
+    // ★ 写 NVS（不是 LittleFS）：整份 JSON 存一个键。NVS 自带磨损均衡 + 每条 CRC，
+    //   分区不随 uploadfs / 文件系统 OTA 重刷而丢。写 flash 有短暂 cache 冻结，但配置写
+    //   低频（配网/绑定/设置），且比原来的 atomicWrite(临时文件+rename 多次 flash 操作)更省。
+    Preferences p;
+    if (!p.begin(CFG_NVS_NS, false)) { LOG("[CFG] ✗ 打开 NVS 命名空间失败\n"); return false; }
+    size_t n = p.putString(CFG_NVS_KEY, js);
+    p.end();
+    if (n == 0) { LOG("[CFG] ✗ NVS 写入失败（putString 返回 0，NVS 满？）\n"); return false; }
+    LOG("[CFG] 配置已写入 NVS（%u B）\n", (unsigned)js.length());
+    return true;
+}
+
+// 恢复出厂：清配置(NVS egg_cfg + LittleFS 旧 /Config)，保留 SN 与视频文件，然后重启。
+// 由 handleBLEWrite 收到 {"factoryReset":true} 时调用（配网态经 BLE 触发，不依赖网络）。
+void ConfigManager::factoryReset() {
+    LOG("[CFG] ★★ 恢复出厂：清配置(NVS egg_cfg + LittleFS /Config)，保留 SN 与视频，重启\n");
+    // 1. 清 NVS 配置命名空间（不碰 SN 的 device_info 命名空间，也不碰视频文件）
+    Preferences p;
+    if (p.begin(CFG_NVS_NS, false)) { p.clear(); p.end(); }
+    // 2. 删 LittleFS 旧配置文件：否则开机迁移逻辑会把它复活。只删 /Config，不动 /def /target 视频。
+    LittleFS.remove(CONFIG_FILE);
+    LittleFS.remove(CONFIG_BACKUP_FILE);
+    LittleFS.remove(CONFIG_TEMP_FILE);
+    LOG("[CFG] 配置已清除，0.5s 后重启进入全新态（无配置 → 自动进配网）\n");
+    Serial.flush();
+    delay(500);
+    ESP.restart();   // 不返回
 }
 
 String ConfigManager::toJsonString() const {
@@ -233,14 +264,6 @@ void ConfigManager::setBool(const char* key, bool value) {
     taskENTER_CRITICAL(&_mux); _doc[key] = value; taskEXIT_CRITICAL(&_mux);
 }
 
-bool ConfigManager::writeFile(const char* path, const String& content) {
-    File f = LittleFS.open(path, FILE_WRITE);
-    if (!f) { LOG("[CFG] 无法打开文件写入: %s\n", path); return false; }
-    size_t written = f.print(content);
-    f.close();
-    return (written == content.length());
-}
-
 String ConfigManager::readFile(const char* path) {
     File f = LittleFS.open(path, FILE_READ);
     if (!f) { LOG("[CFG] 无法打开文件读取: %s\n", path); return ""; }
@@ -275,10 +298,21 @@ void ConfigManager::deinitBLE() {
 // BLE 初始化
 // ----------------------------------------------------------
 void ConfigManager::setupBLE(const char* name) {
+    // ★ 回调对象用函数内 static，不要 new：
+    //   本函数每次 ensureBLEInit()（每次进配网）都会执行一遍。查 NimBLE 2.5.0 源码：
+    //     · NimBLEServer::setCallbacks(cb, deleteCallbacks=true) —— server 析构时会 delete ✓
+    //     · NimBLECharacteristic::setCallbacks(cb) —— 无所有权参数，析构函数只删 descriptor，
+    //       【不删回调】 → 每次配网 new 一个就永久泄漏一个。
+    //   两者都改成 static：只构造一次、地址恒定，NimBLE 无论删不删都不会出问题
+    //   （server 那个显式传 false，避免它去 delete 一个非 new 出来的对象）。
+    //   this 恒为唯一的 Config 单例，static 复用是安全的。
+    static BLEServerCB s_serverCb(this);
+    static BLEWriteCB  s_writeCb(this);
+
     NimBLEDevice::init(name);
 
     _bleServer = NimBLEDevice::createServer();
-    _bleServer->setCallbacks(new BLEServerCB(this));
+    _bleServer->setCallbacks(&s_serverCb, false);   // false = 不要 delete（不是 new 出来的）
 
     NimBLEService* service = _bleServer->createService(BLE_SERVICE_UUID);
 
@@ -288,7 +322,7 @@ void ConfigManager::setupBLE(const char* name) {
 
     _charWrite = service->createCharacteristic(
         BLE_CHAR_WRITE_UUID, NIMBLE_PROPERTY::WRITE);
-    _charWrite->setCallbacks(new BLEWriteCB(this));
+    _charWrite->setCallbacks(&s_writeCb);
 
     _charNotify = service->createCharacteristic(
         BLE_CHAR_NOTIFY_UUID, NIMBLE_PROPERTY::NOTIFY);
@@ -326,6 +360,16 @@ void ConfigManager::handleBLEWrite(const String& payload) {
 
     // ═══ 配网模式 ═══
     if (_provMode) {
+        // ⓿ 恢复出厂：清配置(NVS egg_cfg + LittleFS /Config)，保留 SN 与视频后重启。
+        //    走 BLE 触发（配网态设备可能还没联网，不依赖网络）；最高优先级，先于其它处理。
+        if (incoming.containsKey("factoryReset")) {
+            if (incoming["factoryReset"].as<bool>()) {
+                notifyBLEResult("{\"status\":\"ok\",\"msg\":\"factory reset\"}");
+                factoryReset();   // 内部 ESP.restart()，不返回
+            }
+            return;
+        }
+
         // ① APP 请求断开
         if (incoming.containsKey("connection")) {
             const char* conn = incoming["connection"] | "";
